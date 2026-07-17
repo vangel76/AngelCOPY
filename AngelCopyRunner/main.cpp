@@ -75,6 +75,29 @@ bool ReadListFile(const std::wstring& path, std::vector<std::wstring>& out) {
     return true;
 }
 
+// Free space available to this caller on the volume holding `dir` (quota-aware:
+// uses FreeBytesAvailableToCaller, not the volume total). Returns false if the
+// query fails — a network share that reports nothing must not block the copy.
+bool FreeSpaceAt(const std::wstring& dir, unsigned long long& freeBytes) {
+    ULARGE_INTEGER avail{};
+    if (!GetDiskFreeSpaceExW(dir.c_str(), &avail, nullptr, nullptr)) return false;
+    freeBytes = avail.QuadPart;
+    return true;
+}
+
+// Warn (GUI) if the destination looks too small for what `policy` will copy.
+// Advisory: returns false only if the user cancels at the warning. A failed or
+// unavailable free-space query, or a copy that fits, returns true silently.
+bool SpaceOkOrConfirmed(const std::wstring& dest, const ScanResult& scan,
+                        Conflict policy) {
+    unsigned long long need = NeededSpaceFor(scan, policy);
+    if (need == 0) return true;
+    unsigned long long freeBytes = 0;
+    if (!FreeSpaceAt(dest, freeBytes)) return true; // can't tell -> don't block
+    if (need <= freeBytes) return true;
+    return AskSpaceWarning(need, freeBytes);
+}
+
 int Usage() {
     fwprintf(stderr,
              L"Usage: AngelCopyRunner [--console] <copy|move|sync> <destDir> "
@@ -211,6 +234,9 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         if (!AskSyncConfirm(files, bytes, delScan)) return 0; // nothing touched
+        // Space check after confirmation: the purge frees space but runs after
+        // the copy, so it can't be counted against the copy's need.
+        if (!SpaceOkOrConfirmed(dest, scan, Conflict::Replace)) return 0;
         int code = RunSyncWithUI(jobs, bytes, files, skipped, skipSet, extras);
         return (code >= 8) ? code : 0;
     }
@@ -238,6 +264,10 @@ int wmain(int argc, wchar_t** argv) {
         policy = AskConflict(op, scan.conflicts, scan.conflictSample, cancelled);
         if (cancelled) return 0; // user aborted before anything was touched
     }
+
+    // Space check runs AFTER the conflict prompt: the chosen policy decides how
+    // much is actually written ("Skip existing" needs far less than "Replace").
+    if (!SpaceOkOrConfirmed(dest, scan, policy)) return 0;
 
     unsigned long long bytes = 0, files = 0;
     ExpectedFor(scan, policy, bytes, files);

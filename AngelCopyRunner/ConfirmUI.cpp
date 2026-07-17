@@ -63,6 +63,101 @@ std::wstring HumanBytes(unsigned long long b) {
 
 } // namespace
 
+// Low-disk-space warning. Small fixed dialog, Cancel default, "Try anyway"
+// proceeds — the estimate can be beaten by compression/dedup, so this warns
+// rather than blocks.
+bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeBytes) {
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = Proc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = theme::BgBrush();
+    wc.lpszClassName = L"AngelCopyLowSpace";
+    RegisterClassW(&wc);
+
+    const int cw = 480, ch = 220;
+    const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT rc{0, 0, cw, ch};
+    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
+    int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
+                                loc::T(loc::S::SpaceCaption), kStyle,
+                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    if (!hwnd) return false;
+
+    State st;
+    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
+        LOGFONTW b = ncm.lfMessageFont;
+        b.lfWeight = FW_SEMIBOLD;
+        st.fontBold = CreateFontIndirectW(&b);
+    }
+    if (!st.fontBold) st.fontBold = st.font;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
+
+    unsigned long long shortfall =
+        (neededBytes > freeBytes) ? neededBytes - freeBytes : 0;
+    wchar_t head[256], shortLine[128];
+    StringCchPrintfW(head, 256, loc::T(loc::S::SpaceHead),
+                     HumanBytes(neededBytes).c_str(),
+                     HumanBytes(freeBytes).c_str());
+    StringCchPrintfW(shortLine, 128, loc::T(loc::S::SpaceShort),
+                     HumanBytes(shortfall).c_str());
+
+    HWND lblHead = CreateWindowW(L"STATIC", head, WS_CHILD | WS_VISIBLE, 16, 16,
+                                 cw - 32, 20, hwnd, nullptr, hInst, nullptr);
+    HWND lblShort = CreateWindowW(L"STATIC", shortLine, WS_CHILD | WS_VISIBLE, 16,
+                                  40, cw - 32, 20, hwnd, nullptr, hInst, nullptr);
+    HWND lblHint = CreateWindowW(L"STATIC", loc::T(loc::S::SpaceHint),
+                                 WS_CHILD | WS_VISIBLE, 16, 70, cw - 32, 60, hwnd,
+                                 nullptr, hInst, nullptr);
+
+    const int by = 168, bh = 30;
+    HWND bGo = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnProceedAnyway),
+                             WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false), 16,
+                             by, 170, bh, hwnd, (HMENU)(INT_PTR)ID_DELETE, hInst,
+                             nullptr);
+    HWND bCancel = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnCancel),
+                                 WS_CHILD | WS_VISIBLE | theme::ButtonStyle(true),
+                                 cw - 116, by, 100, bh, hwnd,
+                                 (HMENU)(INT_PTR)IDCANCEL, hInst, nullptr);
+
+    SetFont(lblHead, st.fontBold);
+    SetFont(lblShort, st.font);
+    SetFont(lblHint, st.font);
+    SetFont(bGo, st.font);
+    SetFont(bCancel, st.font);
+
+    theme::ApplyToWindow(hwnd);
+    for (HWND b : {bGo, bCancel}) theme::ApplyToControl(b);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(bCancel);
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+
+    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
+    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    return st.confirmed;
+}
+
 // Mirror confirmation. Shares the window class/pattern with the delete prompt:
 // owner-drawn buttons in dark mode, Cancel default, closing never confirms.
 bool AskSyncConfirm(unsigned long long copyFiles, unsigned long long copyBytes,

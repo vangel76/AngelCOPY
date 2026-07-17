@@ -160,6 +160,46 @@ int wmain() {
               "SkipSetFor(Skip) = same + newer + older");
         check(setRep.count(low(base + L"\\src\\lonely.txt")) == 0,
               "lonely files never in a skip set");
+
+        // Needed disk space: lonely full, overwrites only their growth. The
+        // fixture's files are tiny, so assert the relationships, not literals:
+        // Replace >= OnlyIfNewer >= Skip, and Skip == lonely bytes exactly
+        // (nothing else is written).
+        unsigned long long nRep = NeededSpaceFor(s, Conflict::Replace);
+        unsigned long long nNew = NeededSpaceFor(s, Conflict::ReplaceIfNewer);
+        unsigned long long nSkp = NeededSpaceFor(s, Conflict::Skip);
+        check(nSkp == s.lonelyBytes, "NeededSpace(Skip) = lonely bytes only");
+        check(nNew >= nSkp && nRep >= nNew, "NeededSpace: Replace >= Newer >= Skip");
+        check(nRep <= s.lonelyBytes + s.newerBytes + s.olderBytes,
+              "NeededSpace never exceeds full copied bytes (growth <= size)");
+        RmTree(base);
+    }
+
+    // ---- overwrite growth: only the size increase counts ----
+    {
+        std::wstring base = g_root + L"\\grow";
+        CreateDirectoryW(base.c_str(), nullptr);
+        CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\dest").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\dest\\src").c_str(), nullptr);
+        // src bigger.txt = 1000 B over a 200 B dest -> grows 800.
+        // src smaller.txt = 100 B over a 900 B dest -> grows 0 (shrinks).
+        // NB: 'small' is a macro in <windows.h> (rpcndr.h: #define small char).
+        std::string srcBig(1000, 'B'), srcSmall(100, 's');
+        WriteFileText(base + L"\\src\\bigger.txt", srcBig.c_str(), 0);
+        WriteFileText(base + L"\\dest\\src\\bigger.txt", std::string(200, 'x').c_str(), 0);
+        WriteFileText(base + L"\\src\\smaller.txt", srcSmall.c_str(), 0);
+        WriteFileText(base + L"\\dest\\src\\smaller.txt", std::string(900, 'y').c_str(), 0);
+        // Make both differ in time so they classify as overwrites, not "same".
+        std::vector<std::wstring> sources{base + L"\\src"};
+        auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
+        ScanResult s = ScanJobs(jobs);
+        printf("Overwrite growth:\n");
+        // Both are overwrites (different size => not "same"), so 2 conflicts,
+        // and the growth is 800 + 0 = 800 regardless of newer/older split.
+        check(s.conflicts == 2, "2 overwrites");
+        check(NeededSpaceFor(s, Conflict::Replace) == 800,
+              "growth = 800 (bigger +800, smaller +0), not 1100 full size");
         RmTree(base);
     }
 

@@ -75,6 +75,13 @@ const wchar_t* kEn[] = {
     L"Nothing at the destination needs deleting.",
     L"The destination becomes an exact copy of the source. This cannot be undone.",
     L"Mirror",
+    // low disk space
+    L"AngelCOPY \x2014 Not enough space?",
+    L"This needs about %s, but the destination has only %s free.",
+    L"Short by about %s.",
+    L"The estimate ignores compression and deduplication, so it may still fit. "
+    L"Proceeding risks a partial copy if it does not.",
+    L"Try anyway",
 };
 
 const wchar_t* kDe[] = {
@@ -147,6 +154,14 @@ const wchar_t* kDe[] = {
     L"Am Ziel muss nichts gelöscht werden.",
     L"Das Ziel wird eine exakte Kopie der Quelle. Das kann nicht rückgängig gemacht werden.",
     L"Spiegeln",
+    // low disk space
+    L"AngelCOPY \x2014 Zu wenig Speicher?",
+    L"Es werden etwa %s benötigt, am Ziel sind aber nur %s frei.",
+    L"Es fehlen etwa %s.",
+    L"Die Schätzung berücksichtigt keine Komprimierung oder Deduplizierung, es "
+    L"könnte also doch passen. Fortfahren riskiert eine unvollständige Kopie, "
+    L"falls nicht.",
+    L"Trotzdem versuchen",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");

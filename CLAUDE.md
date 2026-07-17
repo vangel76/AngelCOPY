@@ -156,6 +156,26 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **`%` lines are useless under `/MT`** — they interleave across threads and
   can't be attributed to a file. `/NP` suppresses them. Parseable flags:
   `/BYTES /FP /NC /NDL /NJH /NJS /NP`.
+- **Free-space warning uses OVERWRITE GROWTH, not source size.** robocopy
+  overwrites in-place (measured: 2 GB source over a 500 MB destination consumes
+  ~1.5 GB, and the free-space dip equals the net, never the full 2 GB — no temp
+  sidecar). So `NeededSpaceFor` = lonely bytes (full) + Σ max(0, srcSize −
+  dstSize) over the classes the policy copies. Shrinking files add zero and are
+  never counted as freed (/MT ordering is unknown — never wrong in the
+  dangerous direction). The naive "source size vs free" check would false-alarm
+  on every re-copy of an existing tree; don't reintroduce it.
+  - **Order is load-bearing: conflict prompt first, space check second.** The
+    chosen policy decides how much is written ("Skip existing" needs far less
+    than "Replace"), so the need isn't known until the policy is picked.
+  - Same-volume move is NOT a rename — robocopy `/MOVE` copies then deletes
+    (measured: a 1 GB same-volume move dips the full 1 GB). So a move needs
+    space exactly like a copy; no special-casing.
+  - For mirror the purge frees space but runs AFTER the copy, so it can't offset
+    the copy's need — the check uses the copy figure only.
+  - Advisory, never blocking: compression/dedup/quota can beat the estimate, so
+    the dialog offers "Try anyway" (Cancel default). A failed `GetDiskFreeSpace`
+    ExW (network share reporting nothing) returns "ok" — fail-open, never block.
+    Use `lpFreeBytesAvailableToCaller` (quota-aware), not the volume total.
 - **robocopy's default overwrite is destructive and silent** — it overwrites any
   file that differs, *including overwriting a newer destination with an older
   source*. Hence the conflict prompt (`ConflictUI`) and the `Conflict` policy →

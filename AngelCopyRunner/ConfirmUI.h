@@ -15,4 +15,9 @@ bool AskDeleteConfirm(const DeleteScan& scan);
 bool AskSyncConfirm(unsigned long long copyFiles, unsigned long long copyBytes,
                     const DeleteScan& del);
 
+// Warn that the destination volume looks too small. Advisory only — compression
+// and dedup can defeat the estimate — so "Try anyway" is offered, but Cancel is
+// the default and closing the window does not proceed. Returns true to proceed.
+bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeBytes);
+
 } // namespace angelcopy

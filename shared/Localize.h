@@ -72,6 +72,13 @@ enum class S {
     SyncWarn,
     BtnSync,
 
+    // ---- low-disk-space warning ----
+    SpaceCaption,
+    SpaceHead,         // needed, free  (both %s, pre-formatted)
+    SpaceShort,        // shortfall %s
+    SpaceHint,
+    BtnProceedAnyway,
+
     COUNT
 };
 

@@ -51,6 +51,12 @@ struct ScanResult {
     unsigned long long sameBytes = 0,   sameFiles = 0;   // identical -> skipped
     unsigned long long newerBytes = 0,  newerFiles = 0;  // differs, src not older
     unsigned long long olderBytes = 0,  olderFiles = 0;  // differs, src older
+    // Net disk space an overwrite of these classes ADDS: sum of
+    // max(0, srcSize - dstSize). robocopy overwrites in-place (measured: a 2 GB
+    // source over a 500 MB destination consumes only ~1.5 GB), so the space a
+    // copy needs is the growth, not the full source size. Shrinking files add
+    // nothing (and never count as freed — /MT ordering is unknown).
+    unsigned long long newerGrowBytes = 0, olderGrowBytes = 0;
     unsigned long long conflicts = 0;                    // newerFiles + olderFiles
     std::vector<std::wstring> conflictSample;            // capped, for the dialog
 
@@ -80,6 +86,12 @@ std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs);
 // progress bar must be scaled against, otherwise it never reaches 100%.
 void ExpectedFor(const ScanResult& s, Conflict policy,
                  unsigned long long& bytes, unsigned long long& files);
+
+// Disk space the copy will actually consume at the destination under `policy`.
+// NOT the same as ExpectedFor's byte count: lonely files cost their full size,
+// but overwrites cost only their growth (robocopy writes in-place). Compare
+// this against the destination volume's free space to warn before starting.
+unsigned long long NeededSpaceFor(const ScanResult& s, Conflict policy);
 
 // What will NOT be copied, split by reason, so the UI can report it.
 struct SkipInfo {

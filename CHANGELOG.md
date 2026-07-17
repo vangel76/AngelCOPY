@@ -1,4 +1,4 @@
-![alt text](image.png)# Changelog
+# Changelog
 
 All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
@@ -22,6 +22,21 @@ project aims to follow [Semantic Versioning](https://semver.org/).
   genuinely owned it, in which case the real value is restored.
 
 ### Added
+- **Low-disk-space warning before a copy/move/mirror starts.** The pre-scan now
+  also computes how much space the transfer will actually consume and compares
+  it to the destination volume's free space; if it looks too small, a dialog
+  says how much is needed, how much is free, and the shortfall, before anything
+  is written.
+  - Counts **overwrite growth, not full source size**: robocopy overwrites
+    in-place (measured — a 2 GB source over a 500 MB destination uses ~1.5 GB,
+    with no temporary sidecar), so re-copying an existing tree no longer
+    false-alarms. Shrinking files count as zero, never as freed space.
+  - Runs **after** the conflict prompt, because the chosen policy decides how
+    much is written ("Skip existing" needs far less than "Replace all").
+  - **Advisory, not a hard block**: compression, deduplication or quota can beat
+    the estimate, so "Try anyway" is offered with Cancel as the default. If the
+    free-space query fails (e.g. a network share that reports nothing), the copy
+    proceeds — the warning never blocks on uncertainty.
 - **Mirror ("Spiegeln here FAST").** One-way sync: the destination is made an
   exact copy of the source — files are copied/overwritten, and anything at the
   destination that is not in the source is permanently deleted. On the

@@ -181,15 +181,16 @@ enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
 constexpr unsigned long long kTimeTolerance = 20000000ULL; // 2s in 100ns ticks
 
 // Mirrors robocopy's own comparison: identical == same size and write-time
-// within 2s (FAT/network timestamp granularity).
+// within 2s (FAT/network timestamp granularity). Fills `dstSize` (0 when the
+// destination file is absent) so the caller can compute overwrite growth.
 FileClass Classify(const std::wstring& dst, unsigned long long srcSize,
-                   const FILETIME& srcTime) {
+                   const FILETIME& srcTime, unsigned long long& dstSize) {
+    dstSize = 0;
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     if (!GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &fa))
         return FileClass::Lonely;
 
-    unsigned long long dstSize =
-        ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    dstSize = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
     unsigned long long a = FileTimeToU64(srcTime);
     unsigned long long b = FileTimeToU64(fa.ftLastWriteTime);
     unsigned long long diff = (a > b) ? a - b : b - a;
@@ -202,7 +203,9 @@ FileClass Classify(const std::wstring& dst, unsigned long long srcSize,
 }
 
 void Account(ScanResult& acc, FileClass fc, unsigned long long size,
-             const std::wstring& src, const std::wstring& dst) {
+             unsigned long long dstSize, const std::wstring& src,
+             const std::wstring& dst) {
+    unsigned long long grow = (size > dstSize) ? size - dstSize : 0;
     switch (fc) {
     case FileClass::Lonely:
         acc.lonelyFiles++; acc.lonelyBytes += size;
@@ -213,10 +216,12 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
         return;
     case FileClass::DiffNewer:
         acc.newerFiles++;  acc.newerBytes += size;
+        acc.newerGrowBytes += grow;
         acc.newerPaths.push_back(LowerCopy(src));
         break;
     case FileClass::DiffOlder:
         acc.olderFiles++;  acc.olderBytes += size;
+        acc.olderGrowBytes += grow;
         acc.olderPaths.push_back(LowerCopy(src));
         break;
     }
@@ -244,7 +249,9 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
         } else {
             unsigned long long size =
                 ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            Account(acc, Classify(dst, size, fd.ftLastWriteTime), size, src, dst);
+            unsigned long long dstSize = 0;
+            FileClass fc = Classify(dst, size, fd.ftLastWriteTime, dstSize);
+            Account(acc, fc, size, dstSize, src, dst);
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -267,7 +274,9 @@ ScanResult ScanJobs(const std::vector<RoboJob>& jobs) {
                     continue;
                 unsigned long long size =
                     ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-                Account(r, Classify(dst, size, fa.ftLastWriteTime), size, src, dst);
+                unsigned long long dstSize = 0;
+                FileClass fc = Classify(dst, size, fa.ftLastWriteTime, dstSize);
+                Account(r, fc, size, dstSize, src, dst);
             }
         }
     }
@@ -287,6 +296,17 @@ void ExpectedFor(const ScanResult& s, Conflict policy,
         bytes += s.olderBytes;
         files += s.olderFiles;
     }
+}
+
+unsigned long long NeededSpaceFor(const ScanResult& s, Conflict policy) {
+    // Lonely files cost their full size; overwrites cost only their growth
+    // (in-place, measured). Same files cost nothing under any policy.
+    unsigned long long need = s.lonelyBytes;
+    if (policy == Conflict::Replace || policy == Conflict::ReplaceIfNewer)
+        need += s.newerGrowBytes;
+    if (policy == Conflict::Replace)
+        need += s.olderGrowBytes;
+    return need;
 }
 
 namespace {
