@@ -1,0 +1,13 @@
+# Build output — build.bat regenerates all of it
+build/
+dist/
+
+# Stray compiler/linker leftovers anywhere
+*.obj
+*.exp
+*.ilk
+*.pdb
+
+# Editor/IDE
+.vs/
+*.user
