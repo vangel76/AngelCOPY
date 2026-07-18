@@ -11,3 +11,7 @@ dist/
 # Editor/IDE
 .vs/
 *.user
+
+*.exe
+*.dll
+

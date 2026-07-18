@@ -79,6 +79,31 @@ enum class S {
     SpaceHint,
     BtnProceedAnyway,
 
+    // ---- pre-transfer scan ("Preparing") window ----
+    // Appended at the end (positional tables). Shown immediately while the
+    // destination comparison walks a huge tree — before it existed the user
+    // saw nothing at all for seconds on a 500k-file folder.
+    CapPreparing,
+    HeadPreparing,
+    ScanFound,         // count, nounFile
+
+    // ---- Ctrl+V agent (tray) ----
+    TrayTooltip,
+    TrayEnabled,       // checkable menu item
+    TrayExit,
+
+    // ---- same-folder copy ----
+    // The word Windows inserts for a copy-into-the-same-folder: "x - Kopie" /
+    // "x - Copy". Just the word; the " - " and " (2)" are added in code.
+    CopyWord,
+
+    // ---- completion balloon (agent tray) ----
+    NotifyDoneBody,    // bytes, time  ("Done — 99 GB in 4:12")
+
+    // ---- delete: rate in items/sec, not bytes/sec ----
+    ChartSpeedItems,   // count        (live speed label, delete/purge)
+    StatsDoneItems,    // pct, count, noun, rate  (final summary, delete/purge)
+
     COUNT
 };
 

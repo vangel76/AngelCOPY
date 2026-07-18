@@ -1,5 +1,6 @@
 #pragma once
 #include "Robocopy.h"
+#include <functional>
 #include <vector>
 
 namespace angelcopy {
@@ -16,6 +17,15 @@ namespace angelcopy {
 // one; it must outlive the call.
 // `skipped` is reported at the end; if anything was skipped (or any error
 // occurred) the dialog stays open instead of auto-closing.
+// Run `work` (the pre-transfer scans) on a background thread behind a small
+// "Preparing — analyzing folders" window with a live file counter and Cancel.
+// The window only becomes visible if the work takes longer than ~300 ms, so
+// small transfers never flash it. Returns false if the user cancelled
+// (prog.cancel is set so the scan aborts; its partial results must be
+// discarded). Exists because a 500k-file scan used to run before ANY window,
+// leaving the user staring at nothing for seconds.
+bool RunScanWithUI(ScanProgress& prog, const std::function<void()>& work);
+
 int RunJobsWithUI(Operation op, const std::wstring& destLabel,
                   const std::vector<RoboJob>& jobs,
                   unsigned long long expectedBytes,

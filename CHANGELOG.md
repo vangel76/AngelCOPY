@@ -4,7 +4,88 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] — 2026-07-18
+
+First real release. The headline change since the early internal build (0.1.0)
+is a **native Win32 copy engine that replaces robocopy**, plus deep Explorer
+integration (Ctrl+V / Shift+Delete). The robocopy-era entries further down
+describe the fallback engine, still selectable with `ANGELCOPY_ENGINE=robocopy`.
+
+### Added
+- **Native copy engine (`NativeCopy.cpp`) — replaces robocopy execution.** All
+  tuning constants are measured (`bench\bench.cpp`, NVMe); re-run it before
+  changing any of them.
+  - Small files: `CopyFileExW` thread pool, **one thread per directory in
+    256-file chunks, 16 threads** — measured **+33%** vs `robocopy /MT:64` on a
+    nested 10k×64 KiB tree, parity on a single flat directory. More threads
+    collapse on NTFS same-directory create contention (64 thr: 130 MB/s vs 16
+    thr sharded: 428 MB/s).
+  - Big files (≥ 32 MiB): **unbuffered overlapped ring, QD8 × 8 MiB over an
+    IOCP** — measured **+32%** (3200 vs 2430 MB/s on a cold 8 GiB file). This is
+    robocopy's one structural weakness gone: it never splits a single file.
+  - Moves: **attempt `MoveFileExW` first** — a same-volume move is a rename
+    (**~1500×**: 0.7 ms vs ~1 s for 2 GiB), whole-tree when the destination is
+    absent; copy+delete only on `ERROR_NOT_SAME_DEVICE`. The filesystem decides
+    same-volume, no path heuristics.
+  - The walk **streams** into the copy pool (`WalkStream` + `ChunkQueue`):
+    copying starts on the first directory while the rest is still being
+    enumerated. A 500k-file folder no longer sits at 0% during a second walk.
+  - Progress, skips and errors come from real `CopySink` callbacks — no child
+    process, no pipe parsing, no `GetProcessIoCounters` detour, exact skips.
+  - Full semantics parity with the old flags (/E, /COPY:DAT, /R:2 /W:2, /XJ),
+    `\\?\` long paths, read-only overwrite, clean cancel (partials removed).
+  - `ANGELCOPY_ENGINE=robocopy` selects the old path (A/B); `ANGELCOPY_THREADS`
+    overrides the pool size (for a future SMB measurement).
+- **Ctrl+V acceleration in Explorer (`AngelCopyAgent.exe`).** A tray agent with
+  a low-level keyboard hook routes Ctrl+V through AngelCOPY: Ctrl+C → copy,
+  Ctrl+X → move (per the clipboard's drop effect). **Fail-open** throughout —
+  virtual folders, edit-control focus (address bar / search / F2-rename) and a
+  missing agent all fall back to native Ctrl+V; the hook ignores its own
+  injected replay so it can't loop. Windows offers no supported Ctrl+V shell
+  hook, so this is the only clean route.
+- **Shift+Delete acceleration.** The agent also intercepts Shift+Delete →
+  permanent delete of the Explorer **selection** through our engine
+  (confirmation + parallel delete). Same edit-focus/empty-selection
+  passthrough.
+- **Parallel delete.** The deleter now streams into a dir-sharded 8-thread pool
+  — measured **3.9×** over the previous single-threaded recursion (10k files:
+  ~1400 ms → ~350 ms). An earlier note that parallelism buys "~20% at best"
+  measured *naive* parallelism; per-directory sharding is the real win, same as
+  the copy pool. Junctions are still removed as links, never recursed into.
+- **Same-folder copy makes "&lt;name&gt; - Kopie".** Pasting an item into the
+  folder it already lives in produces a renamed copy (`… - Kopie` / `… - Copy`,
+  bumped to ` (2)`, ` (3)`), exactly like Explorer, instead of doing nothing.
+- **"Preparing" window** during the pre-transfer scan: a huge tree takes
+  seconds to classify, and there was previously no feedback at all. Shows a
+  live file counter, only appears after ~300 ms (small transfers never flash
+  it), and cancelling there touches nothing.
+- **Instant whole-tree rename move.** A same-volume move whose destination
+  doesn't exist completes as one rename **before any scan or window** — an
+  Explorer-style instant move of a 500k-file folder.
+- **Colored taskbar-button progress** (`ITaskbarList3`): the transfer dialog's
+  taskbar button fills green, turns red on error — visible when the dialog is
+  minimized or covered.
+- **Completion balloon.** A clean transfer that took ≥ 3 s pops a tray balloon
+  ("Done — 99 GB in 4:12") via the agent, so you can click away and still be
+  told when it finishes.
+- **Windows 11 classic-menu installer option (default OFF).** Optionally
+  restores the full right-click menu so our classic entries sit on the first
+  level instead of under "Show more options". Ownership-safe: if the key
+  already exists it is never touched, on install or uninstall.
+
+### Changed
+- **The paste context-menu entry now names the verb** — "Copy here FAST" after
+  Ctrl+C, "Move here FAST" after Ctrl+X — instead of a generic "Paste".
+- **Delete (and the mirror purge phase) show items/sec, not bytes/sec.**
+  Deletion is NTFS-metadata bound; a byte rate read "12 GB/s" one tick and 0
+  the next. The rate, ETA, chart curve and final summary all run on files/sec
+  there.
+- Menu and help text no longer say "robocopy /MT:64" (the engine is native now).
+
+---
+
+The entries below were developed before the native engine, against the
+robocopy-based path (now the `ANGELCOPY_ENGINE=robocopy` fallback):
 
 ### Removed
 - **The invisible drag & drop interception never worked and has been removed.**
@@ -186,9 +267,10 @@ project aims to follow [Semantic Versioning](https://semver.org/).
   error-code marker instead of the word "ERROR", so errors are captured on
   localized Windows (e.g. German robocopy prints "FEHLER").
 
-## [1.0.0] — 2026-07-15
+## [0.1.0] — 2026-07-15
 
-Initial release.
+First internal build (robocopy-based, with the since-removed drop handler).
+Superseded by 1.0.0; kept for history.
 
 ### Added
 - **AngelCopyRunner.exe** — worker process wrapping `robocopy /MT:64`

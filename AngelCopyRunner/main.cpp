@@ -20,13 +20,16 @@
 // writes one to avoid the command-line length limit when many items are moved.
 
 #include "Robocopy.h"
+#include "NativeCopy.h"
 #include "ProgressUI.h"
 #include "ConflictUI.h"
 #include "ConfirmUI.h"
 #include "Delete.h"
+#include "../shared/Localize.h"
 
 #include <windows.h>
 #include <conio.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -143,9 +146,8 @@ int wmain(int argc, wchar_t** argv) {
             return 3;
         }
 
-        DeleteScan scan = ScanDelete(targets);
-
         if (consoleMode) {
+            DeleteScan scan = ScanDelete(targets);
             // Headless: no prompt is possible, and this is irreversible — so
             // require an explicit opt-in rather than silently deleting.
             if (GetEnvironmentVariableW(L"ANGELCOPY_CONFIRM_DELETE", nullptr, 0) == 0) {
@@ -163,6 +165,13 @@ int wmain(int argc, wchar_t** argv) {
             int rc = DeleteTargets(targets, sink);
             return rc >= 8 ? rc : 0;
         }
+
+        // GUI: the pre-delete count of a huge tree takes seconds — run it
+        // behind the "Preparing" window so the user sees life immediately.
+        ScanProgress prog;
+        DeleteScan scan;
+        if (!RunScanWithUI(prog, [&] { scan = ScanDelete(targets, &prog); }))
+            return 0; // cancelled during the count: nothing touched
 
         if (!AskDeleteConfirm(scan)) return 0; // nothing touched
         int code = RunDeleteWithUI(targets, scan.bytes, scan.files);
@@ -194,22 +203,14 @@ int wmain(int argc, wchar_t** argv) {
         return 3;
     }
 
-    std::vector<RoboJob> jobs = PlanJobs(op, dest, sources);
+    std::vector<RoboJob> jobs =
+        PlanJobs(op, dest, sources, loc::T(loc::S::CopyWord));
 
     // ---- sync (mirror): confirmed copy + purge ----
     if (sync) {
-        ScanResult scan = ScanJobs(jobs);
-        unsigned long long bytes = 0, files = 0;
-        // A mirror overwrites whatever differs — Replace, no conflict prompt;
-        // the confirmation below states it instead.
-        ExpectedFor(scan, Conflict::Replace, bytes, files);
-        SkipInfo skipped = SkippedFor(scan, Conflict::Replace);
-        std::unordered_set<std::wstring> skipSet =
-            SkipSetFor(scan, Conflict::Replace);
-        std::vector<std::wstring> extras = ScanExtras(jobs);
-        DeleteScan delScan = ScanDelete(extras);
-
         if (consoleMode) {
+            std::vector<std::wstring> extras = ScanExtras(jobs);
+            DeleteScan delScan = ScanDelete(extras);
             // Headless mirror deletes without a prompt — same explicit opt-in
             // as headless delete.
             if (!extras.empty() &&
@@ -221,7 +222,7 @@ int wmain(int argc, wchar_t** argv) {
                          delScan.files + delScan.dirs);
                 return 3;
             }
-            int worst = RunJobs(op, jobs, Conflict::Replace);
+            int worst = RunJobsConsole(op, jobs, Conflict::Replace);
             if (worst < 8) {
                 DeleteSink sink;
                 sink.onError = [](const std::wstring& m) {
@@ -233,6 +234,27 @@ int wmain(int argc, wchar_t** argv) {
             return worst >= 8 ? worst : 0;
         }
 
+        // GUI: all three pre-scans (source classify, destination extras,
+        // delete count) behind the "Preparing" window.
+        ScanProgress prog;
+        ScanResult scan;
+        std::vector<std::wstring> extras;
+        DeleteScan delScan;
+        if (!RunScanWithUI(prog, [&] {
+                scan = ScanJobs(jobs, &prog);
+                if (!prog.cancel) extras = ScanExtras(jobs, &prog);
+                if (!prog.cancel) delScan = ScanDelete(extras, &prog);
+            }))
+            return 0; // cancelled during the scan: nothing touched
+
+        unsigned long long bytes = 0, files = 0;
+        // A mirror overwrites whatever differs — Replace, no conflict prompt;
+        // the confirmation below states it instead.
+        ExpectedFor(scan, Conflict::Replace, bytes, files);
+        SkipInfo skipped = SkippedFor(scan, Conflict::Replace);
+        std::unordered_set<std::wstring> skipSet =
+            SkipSetFor(scan, Conflict::Replace);
+
         if (!AskSyncConfirm(files, bytes, delScan)) return 0; // nothing touched
         // Space check after confirmation: the purge frees space but runs after
         // the copy, so it can't be counted against the copy's need.
@@ -242,19 +264,33 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (consoleMode) {
-        // Headless: no prompt possible, so use robocopy's default behavior.
-        int worst = RunJobs(op, jobs, Conflict::Replace);
+        // Headless: no prompt possible, so use the Replace default.
+        int worst = RunJobsConsole(op, jobs, Conflict::Replace);
         if (worst >= 8) {
             fwprintf(stderr,
-                     L"\n[AngelCOPY] finished with errors (robocopy code %d).\n",
+                     L"\n[AngelCOPY] finished with errors (code %d).\n",
                      worst);
             return worst;
         }
         return 0;
     }
 
-    // GUI mode: pre-scan classifies every file against the destination.
-    ScanResult scan = ScanJobs(jobs);
+    // Same-volume whole-tree moves with absent destinations complete as a
+    // single rename BEFORE any scan or window: no conflict is possible there,
+    // and walking 500k files first would be pure ceremony. Cross-volume or
+    // existing destinations fall through to the normal flow.
+    if (op == Operation::Move && UseNativeEngine()) {
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(), TryQuickRenameMove),
+                   jobs.end());
+        if (jobs.empty()) return 0; // everything moved by rename — done
+    }
+
+    // GUI mode: pre-scan classifies every file against the destination,
+    // behind the "Preparing" window (a huge tree takes seconds to walk).
+    ScanProgress prog;
+    ScanResult scan;
+    if (!RunScanWithUI(prog, [&] { scan = ScanJobs(jobs, &prog); }))
+        return 0; // cancelled during the scan: nothing touched
 
     // Only prompt when files would actually be overwritten. Identical files are
     // skipped by robocopy and are not conflicts.

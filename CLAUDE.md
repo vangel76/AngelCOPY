@@ -5,7 +5,8 @@ Guidance for working in this repo.
 ## What this is
 
 A Windows shell extension that replaces Explorer's slow single-threaded copy
-with `robocopy /MT:64`. Nothing is invisible — Windows offers no supported hook
+with a native Win32 copy engine (`NativeCopy.cpp`; robocopy remains as an A/B
+fallback via `ANGELCOPY_ENGINE=robocopy`). Nothing is invisible — Windows offers no supported hook
 for Ctrl+V or a left drag (see gotchas). Integration is a **right-drag** menu
 (Copy/Move here FAST) plus right-click **Copy / Paste / Delete FAST**. Native
 dialogs show progress, conflicts and confirmation. Personal-use, unsigned, x64.
@@ -29,13 +30,23 @@ build.bat                                             REM -> dist\*.dll, *.exe
   scan classification, skip sets, real robocopy outcomes) and `tests\test_sync.cpp`
   (`ScanExtras`: lonely dest entries, type mismatches, loose-file jobs never
   purge). Compile each with `Robocopy.cpp` + `Shlwapi.lib`, run, expect ALL PASS.
+- **Native engine unit tests:** `tests\test_native.cpp` (policy matrix on real
+  files, tree/empty-dir copy, rename moves + skip-policy leftovers, junction
+  safety, big-file ring incl. unaligned tail, read-only overwrite, cancel,
+  skip/byte accounting). Compile with `NativeCopy.cpp` + `Robocopy.cpp` +
+  `Shlwapi.lib`, run, expect ALL PASS.
+- **Engine benchmarks:** `bench\bench.cpp` (+ `bench\build_bench.bat`) —
+  standalone robocopy-vs-native measurements (cold cache via
+  FILE_FLAG_NO_BUFFERING eviction, flush-to-disk inside every timing). The
+  numbers in the native-engine gotchas below come from it; re-run before
+  changing any tuning constant.
   Junction safety for mirror is covered by running `--console sync` against a
   tree whose destination holds a junction to a PRECIOUS folder — the link goes,
   the target survives.
 - **Do NOT auto-register on the dev machine** — it kills and restarts the live
   Explorer. Let the user run `AngelCOPY-Setup.exe` or `scripts\install-dev.bat`.
 
-## Architecture (three artifacts)
+## Architecture (four artifacts)
 
 - `AngelCopyShell/` — x64 in-proc COM DLL, **raw COM (no ATL)** on purpose, so it
   builds regardless of which VS components are present. Kept thin: it only
@@ -59,11 +70,22 @@ build.bat                                             REM -> dist\*.dll, *.exe
   - `Guids.cpp`, `dllmain.cpp` (factory + exports), `AngelCopyShell.def`.
 - `AngelCopyRunner/` — x64 console-subsystem exe. The worker; separate process
   so a hang/crash never destabilizes Explorer.
+  - `NativeCopy.cpp` — **the copy engine** (July 2026; replaced robocopy
+    execution, planning/scan layer unchanged). Small files: `CopyFileExW`
+    thread pool, one thread per directory in 256-file chunks, 16 threads.
+    Big files (>= 32 MiB): unbuffered overlapped ring, QD8 x 8 MiB over an
+    IOCP. Moves: attempt `MoveFileExW` first (whole-tree rename when the
+    destination is absent; per-file otherwise), copy+delete only on
+    `ERROR_NOT_SAME_DEVICE`. Progress/skips/errors via `CopySink` callbacks.
+    Semantics parity with the old flags: /E, /COPY:DAT, /R:2 /W:2, /XJ.
+    `ANGELCOPY_ENGINE=robocopy` selects the old path; `ANGELCOPY_THREADS`
+    overrides the pool size for future measurements (e.g. SMB).
   - `Robocopy.cpp` — `PlanJobs` (dirs → whole-tree jobs; loose files grouped by
     parent dir), `BuildRobocopyArgs` (`parseable` toggles the machine-readable
     flag set; `Conflict` policy adds `/XO` etc.), `ScanJobs` (classifies every
-    file vs. the destination: lonely/same/newer/older), `ExpectedFor`, console
-    `RunJobs`.
+    file vs. the destination: lonely/same/newer/older), `ClassifyFile` (public:
+    the native engine must decide exactly like the scan), `ExpectedFor`,
+    console `RunJobs` (fallback engine).
   - `ProgressUI.cpp` — native Win32 dialog + worker thread that spawns robocopy
     with a redirected pipe and parses output.
   - `ConflictUI.cpp` — pre-transfer conflict prompt (Replace / Only if newer /
@@ -80,11 +102,79 @@ build.bat                                             REM -> dist\*.dll, *.exe
     bearing order: **copy first, purge second, and never purge if the copy
     returned >= 8** — a failed copy must not delete the destination's only copy
     of anything. A cancel between phases leaves a superset of the source: safe.
+    - **Same-folder copy ("<name> - Kopie"):** pasting an item into the folder it
+    already lives in makes a renamed copy (Explorer behavior) instead of
+    colliding with itself. `PlanJobs` detects `dst == src` (case-insensitive):
+    a whole-tree self-copy renames `dstDir` (via `UniqueCopyName`, bumps to
+    " (2)", " (3)" …); a loose-file self-copy becomes its own job with
+    `RoboJob::dstNames[i]` set. A same-folder MOVE is dropped as a no-op (never
+    self-destruct). `copyWord` ("Kopie"/"Copy") is passed INTO PlanJobs so
+    Robocopy.cpp keeps no Localize dependency (the unit tests don't link it).
+    The robocopy fallback engine can't rename per file, so this is native-only.
   - `main.cpp` — arg parse, `--console` vs GUI dispatch, scan → prompt → run.
-- `shared/Localize.*` — all user-visible strings, compiled into BOTH binaries.
+- `AngelCopyAgent/` — x64 Windows-subsystem tray exe: the Ctrl+V interceptor
+  (see the Ctrl+V gotcha below for the design laws). Compiles
+  `AngelCopyShell/Common.cpp` (clipboard + LaunchRunner; `g_hModule` stays
+  null -> ModuleDir() = exe dir) and `shared/Localize.cpp`.
+- `shared/Localize.*` — all user-visible strings, compiled into ALL binaries.
 - `installer/AngelCOPY.iss` — Inno Setup. DLL entry has `regserver` (Inno calls
   Dll(Un)RegisterServer) + `uninsrestartdelete`; restarts Explorer on
   install/uninstall.
+
+## Native engine gotchas (all measured — re-run bench\bench.cpp before "fixing")
+
+- **Tuning constants are measurements, not guesses.** 16 pool threads: {8,16,
+  32,64} swept, >16 collapses on NTFS same-directory create contention (64 thr:
+  130 MB/s vs 16 thr sharded: 428 MB/s on 10k x 64 KiB). Ring QD8 x 8 MiB beat
+  QD16 x 16 MiB. Numbers: small nested +33% vs robocopy /MT:64, flat parity,
+  8 GiB +32%, same-volume move ~1500x (rename vs copy+delete).
+- **Directory sharding is the small-file win, chunking is its safety net.** One
+  thread per directory avoids create contention; without the 256-file chunk
+  split a single flat directory degenerates to ONE thread (measured: 111 MB/s
+  vs 201). Don't "simplify" either half away.
+- **`CopyFileExW` stays the per-file primitive.** Three measured/structural
+  reasons: Win11 kernel fast-path (manual ReadFile/WriteFile loop measured
+  ~40% slower on small files), SMB server-side copy (a manual loop would drag
+  every byte over the wire twice), and free attribute+mtime+progress+cancel
+  handling. Don't hand-roll small-file I/O.
+- **Buffered big-file timings lie without a flush.** The page cache absorbs
+  gigabytes; a timing that stops when the call returns measures RAM (first
+  bench: 4.5 GB/s "copy"). Every bench timing flushes inside the timed region;
+  keep it that way.
+- **Moves are attempt-rename-first, never path-compared.** `MoveFileExW`
+  without `MOVEFILE_COPY_ALLOWED`; only `ERROR_NOT_SAME_DEVICE` falls back to
+  copy+delete. The filesystem answers same-volume questions — subst/junction/
+  UNC path heuristics don't. Whole-tree rename only when the destination dir
+  is absent (that's what keeps it one metadata op).
+- **The pre-transfer scan runs behind the "Preparing" window** (`RunScanWithUI`
+  in ProgressUI.cpp): a 500k-file tree takes seconds to classify, and before
+  this existed the user saw NOTHING until the scan finished. The window shows
+  a live file counter (`ScanProgress`, threaded through ScanJobs / ScanExtras /
+  ScanDelete) and only becomes visible after ~300 ms so small transfers never
+  flash it. Cancel during the scan aborts with nothing touched.
+- **GUI moves try `TryQuickRenameMove` BEFORE any scan**: a whole-tree move
+  whose destination doesn't exist can't conflict, so a same-volume drag of a
+  500k-file folder completes instantly with no window at all (Explorer-style).
+  Don't add a scan "for the progress totals" there — there is nothing to show.
+- **The engine's walk STREAMS into the copy pool** (`WalkStream` + `ChunkQueue`):
+  the pool copies the first directory while later ones are still being
+  enumerated, and skips advance the green bar during the walk. The first
+  version collected the whole plan before copying — on 500k files the dialog
+  sat at 0% for the entire (second) walk. Do not reintroduce a collect-then-
+  execute phase. The engine deliberately re-classifies rather than reusing the
+  Preparing scan's results: the scan keeps only aggregates (a 500k-item work
+  list would pin hundreds of MB), decisions must apply to the tree as it is at
+  copy time, and streamed re-classification is warm-cached metadata overlapped
+  with I/O — wall-clock free.
+- **The engine's walk must mirror `ScanTree` exactly** (reparse points skipped,
+  same classification via the shared `ClassifyFile`), or the progress totals
+  and the conflict prompt drift from what actually happens.
+- **No SMB measurements exist yet.** Thread count / QD on shares is unknown —
+  defaults stay the locally-measured ones, `ANGELCOPY_THREADS` exists so a
+  future share can be measured. Do NOT ship remote-path heuristics unmeasured.
+- **No CPU/cache tuning (AMD X3D etc.).** Copying is I/O- and NTFS-metadata-
+  bound; nothing revisits cache lines. Same unmeasurable-heuristic trap as the
+  HDD detection below.
 
 ## Load-bearing gotchas
 
@@ -100,10 +190,31 @@ build.bat                                             REM -> dist\*.dll, *.exe
   the shell honours for drag & drop is `shellex\DragDropHandlers` (right-drag);
   truly invisible left-drag would require hooking `IFileOperation` inside
   explorer.exe — the same fragile/AV-flagged class of hack rejected for Ctrl+V.
-- **Ctrl+V stays with Windows — decided, don't re-propose.** The only
-  non-injection route (a WH_KEYBOARD_LL background agent, PowerToys-style, with
-  fail-open pass-through) was designed and offered in July 2026; the user chose
-  not to build it. Paste FAST in the context menu is the paste integration.
+- **Ctrl+V is intercepted by `AngelCopyAgent.exe`** (decision revised July 2026
+  after initially declining). WH_KEYBOARD_LL tray agent, PowerToys-style.
+  Design laws, all load-bearing:
+  - **The hook callback does ONLY cheap user32 checks** (foreground class
+    CabinetWClass/ExploreWClass, `IsClipboardFormatAvailable(CF_HDROP)`, focus
+    class). COM folder resolution happens on the main thread AFTER the
+    swallow. A slow callback gets the hook silently removed by Windows.
+  - **Fail-open everywhere:** resolution failure (virtual folder, zip, This
+    PC) REPLAYS Ctrl+V via SendInput; the hook ignores `LLKHF_INJECTED`
+    events so the replay can't loop. Agent dead/absent -> native Ctrl+V.
+  - **Focus in any *EDIT* class passes through** — address bar, search box,
+    F2-rename must keep native TEXT paste.
+  - **A cut is consumed:** after launching a move-paste the agent empties the
+    clipboard (Explorer semantics — a second Ctrl+V must not re-move).
+  - **Shift+Delete** is intercepted too -> runner `delete` (confirmation +
+    parallel permanent delete) on the Explorer SELECTION. Same edit-focus
+    passthrough; empty/virtual selection replays native Shift+Delete.
+  - Resolution via `GetActiveShellView(hwnd)` (IShellWindows -> match HWND ->
+    IShellBrowser -> QueryActiveShellView). Folder: IFolderView ->
+    IPersistFolder2 -> SIGDN_FILESYSPATH. Selection: IShellView::GetItemObject
+    (SVGIO_SELECTION) -> CF_HDROP. `AngelCopyAgent.exe --test-resolve` writes
+    every open window's folder AND selection to %TEMP%\acp_agent_test.txt —
+    headless verification.
+  - Installer: autostarts via HKLM Run key, starts it post-install, kills it
+    pre-install/uninstall (the exe is locked while running).
 - **Never invent a CLSID.** `{BB2E617C-...}` was used as "the stock drop handler"
   and does not exist on Windows at all. It was also written into the registry on
   uninstall as a "restore", i.e. pure junk. If a handler key did not exist before
@@ -233,6 +344,27 @@ build.bat                                             REM -> dist\*.dll, *.exe
   package — deliberately out of scope for this unsigned personal build.
 - Explorer keeps the DLL loaded → updating it requires an Explorer restart (the
   installer/dev scripts handle this).
+
+## Taskbar progress + completion balloon
+
+- **Colored taskbar-button progress** (`ITaskbarList3`, ProgressUI.cpp): the
+  transfer dialog's taskbar button fills green (`TBPF_NORMAL` +
+  `SetProgressValue`), turns red on error (`TBPF_ERROR`), clears on close. Only
+  the main transfer dialog has it — the "Preparing" window is a tool-window
+  with no taskbar button on purpose. Needs COM: `RunUI` does its own
+  `CoInitializeEx`/`CoUninitialize` and links `Ole32.lib`.
+- **"Done" balloon via the agent, NOT the runner.** On a clean run that took
+  >= 3 s the runner sends `WM_COPYDATA` (dwData 1, body text) to the agent
+  window (`FindWindowW(L"AngelCopyAgentWnd")`); the agent pops the balloon on
+  its persistent tray icon. The runner deliberately grows no tray icon of its
+  own — it exits right after completion, which would kill any balloon it
+  owned. Agent absent -> no balloon (graceful). Under 3 s or cancelled -> none
+  (no popup spam on quick copies).
+- **Delete shows items/sec, not bytes/sec.** Deletion is NTFS-metadata bound;
+  a byte rate reads "12 GB/s" one tick and 0 the next. `UiState::deleteMode`
+  (pure delete) or `phaseDelete` (mirror purge) switches the live rate, ETA,
+  the chart curve height AND the final summary to files/sec (`ChartSpeedItems`
+  / `StatsDoneItems`). Everything else stays bytes.
 
 ## Progress dialog: chart + theme
 

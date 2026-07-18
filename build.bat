@@ -28,16 +28,25 @@ rem MSVC reads the sources in the local ANSI codepage and mangles the umlauts.
 echo [AngelCOPY] Compiling AngelCopyRunner.exe ...
 cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
    AngelCopyRunner\main.cpp AngelCopyRunner\Robocopy.cpp ^
+   AngelCopyRunner\NativeCopy.cpp ^
    AngelCopyRunner\ProgressUI.cpp AngelCopyRunner\ConflictUI.cpp ^
    AngelCopyRunner\ConfirmUI.cpp AngelCopyRunner\Delete.cpp ^
    shared\Localize.cpp shared\Theme.cpp ^
    /Fe:dist\AngelCopyRunner.exe ^
-   /link /MANIFEST:EMBED Shlwapi.lib Comctl32.lib Gdi32.lib User32.lib Advapi32.lib
+   /link /MANIFEST:EMBED Shlwapi.lib Comctl32.lib Gdi32.lib User32.lib Advapi32.lib Ole32.lib
 if errorlevel 1 exit /b 1
 rem /MANIFEST:EMBED is load-bearing: the ComCtl32 v6 dependency must live INSIDE
 rem the exe. As an external .manifest it works only while that file sits next to
 rem the exe -- the installer ships just the exe, so the dialog would silently
 rem fall back to unthemed controls once installed.
+
+echo [AngelCOPY] Compiling AngelCopyAgent.exe ...
+cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
+   AngelCopyAgent\main.cpp AngelCopyShell\Common.cpp shared\Localize.cpp ^
+   /Fe:dist\AngelCopyAgent.exe ^
+   /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
+   User32.lib Shell32.lib Shlwapi.lib Ole32.lib OleAut32.lib
+if errorlevel 1 exit /b 1
 
 echo [AngelCOPY] Compiling AngelCopyShell.dll ...
 cl /nologo /std:c++17 /EHsc /W4 /O2 /LD /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^

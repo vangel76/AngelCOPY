@@ -1,11 +1,13 @@
 #include "ProgressUI.h"
 #include "Delete.h"
+#include "NativeCopy.h"
 #include "../shared/Localize.h"
 #include "../shared/Theme.h"
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shlwapi.h>
+#include <shobjidl.h>   // ITaskbarList3
 #include <strsafe.h>
 #include <cwctype>
 #include <deque>
@@ -350,6 +352,52 @@ int RunRobocopyJobs(Shared& shared, Operation op,
     return worst;
 }
 
+// Worker: the native engine, feeding Shared directly. No child process, so no
+// IO-counter detour (bytesFromIo stays false), no pipe parsing, no skip-set
+// path matching — the engine reports bytes, files, skips and errors exactly.
+int RunNativeUiJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
+                    Conflict policy) {
+    CopySink sink;
+    sink.onBytes = [&sh](unsigned long long d) {
+        EnterCriticalSection(&sh.cs);
+        sh.doneBytes += d;
+        LeaveCriticalSection(&sh.cs);
+    };
+    sink.onFileStart = [&sh](const std::wstring& p) {
+        EnterCriticalSection(&sh.cs);
+        sh.currentFile = p;
+        LeaveCriticalSection(&sh.cs);
+    };
+    sink.onFileDone = [&sh](const std::wstring&, unsigned long long) {
+        EnterCriticalSection(&sh.cs);
+        sh.doneFiles += 1;
+        LeaveCriticalSection(&sh.cs);
+    };
+    sink.onSkip = [&sh](const std::wstring& p, unsigned long long size) {
+        EnterCriticalSection(&sh.cs);
+        sh.skipBytes += size;
+        sh.doneFiles += 1;
+        sh.currentFile = p;
+        LeaveCriticalSection(&sh.cs);
+    };
+    sink.onError = [&sh](const std::wstring& msg) {
+        EnterCriticalSection(&sh.cs);
+        if (sh.errors.size() < 200) sh.errors.push_back(msg);
+        LeaveCriticalSection(&sh.cs);
+    };
+    sink.cancelled = [&sh] {
+        return InterlockedCompareExchange(&sh.cancel, 0, 0) != 0;
+    };
+    return RunNativeJobs(op, jobs, policy, sink);
+}
+
+// Copy worker dispatch: native engine unless ANGELCOPY_ENGINE=robocopy.
+int RunCopyJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
+                Conflict policy) {
+    return UseNativeEngine() ? RunNativeUiJobs(sh, op, jobs, policy)
+                             : RunRobocopyJobs(sh, op, jobs, policy);
+}
+
 // Worker: permanent recursive delete, reporting into the same Shared state the
 // robocopy path uses, so the dialog shows progress and errors identically.
 int RunDelete(Shared& sh, const std::vector<std::wstring>& targets) {
@@ -411,8 +459,12 @@ std::wstring FormatEta(double sec) {
 
 struct UiState {
     Shared* sh;
+    HWND hwnd;   // top-level window, for the taskbar progress button
     HWND chart, lblTitle, lblName, lblEta, lblRemaining, btnCancel, edErrors;
     HFONT font, fontBold;
+    ITaskbarList3* taskbar = nullptr; // colored taskbar-button progress; may be null
+    bool deleteMode = false;          // rate/label in items/sec, not bytes/sec
+    bool itemsRateNow = false;        // effective this tick (delete or purge phase)
     ULONGLONG startTick;
     // (tick, doneBytes) history for the sliding-window rate.
     std::deque<std::pair<ULONGLONG, unsigned long long>> hist;
@@ -430,6 +482,7 @@ struct UiState {
     ULONGLONG lastSampleTick = 0;
     unsigned long long lastSampleReal = 0; // copied bytes at the last sample
     unsigned long long lastSampleSkip = 0; // skipped bytes at the last sample
+    unsigned long long lastSampleFiles = 0; // done files at the last sample (delete)
     int pct = 0;                     // drives the progress band AND the curve end
     double rateNow = 0;              // smoothed, for the in-chart label
 };
@@ -597,9 +650,14 @@ void PaintChart(HWND hwnd, UiState* ui) {
     }
 
     // Speed label, inside the chart at the top right (as Windows does).
+    // Bytes/sec normally, items/sec during a delete/purge.
     wchar_t speed[96];
-    StringCchPrintfW(speed, 96, loc::T(loc::S::ChartSpeed),
-                     HumanBytes((unsigned long long)ui->rateNow).c_str());
+    if (ui->itemsRateNow)
+        StringCchPrintfW(speed, 96, loc::T(loc::S::ChartSpeedItems),
+                         (unsigned long long)ui->rateNow);
+    else
+        StringCchPrintfW(speed, 96, loc::T(loc::S::ChartSpeed),
+                         HumanBytes((unsigned long long)ui->rateNow).c_str());
     SetBkMode(mem, TRANSPARENT);
     SetTextColor(mem, c.text);
     HGDIOBJ oldFont = SelectObject(mem, ui->font);
@@ -675,12 +733,21 @@ void UpdateUi(UiState* ui) {
     ULONGLONG now = GetTickCount64();
     double elapsed = (now - ui->startTick) / 1000.0;
 
-    ui->hist.emplace_back(now, realDone);
+    // Deletion is NTFS-metadata work: bytes/sec is meaningless there (it would
+    // read "12 GB/s" one tick, "0" the next). The rate, ETA and the curve run
+    // on FILES/sec instead — for a pure delete always, and for a mirror during
+    // its purge phase. Everything else stays bytes.
+    const bool itemsRate = ui->deleteMode || phaseDel;
+    ui->itemsRateNow = itemsRate;
+    const unsigned long long rateUnit = itemsRate ? dFiles : realDone;
+    const unsigned long long rateTotal = itemsRate ? tFiles : totalReal;
+
+    ui->hist.emplace_back(now, rateUnit);
     while (ui->hist.size() > 2 && (now - ui->hist.front().first) > 3000)
         ui->hist.pop_front();
 
-    // Overall average: everything copied so far divided by the time it took.
-    double avgRate = (elapsed > 0.05) ? (double)realDone / elapsed : 0.0;
+    // Overall average: everything done so far divided by the time it took.
+    double avgRate = (elapsed > 0.05) ? (double)rateUnit / elapsed : 0.0;
 
     double rate = 0.0;
     if (ui->done) {
@@ -688,18 +755,17 @@ void UpdateUi(UiState* ui) {
     } else {
         const auto& oldest = ui->hist.front();
         double span = (now - oldest.first) / 1000.0;
-        if (span >= 0.5 && realDone >= oldest.second)
-            rate = (double)(realDone - oldest.second) / span;
+        if (span >= 0.5 && rateUnit >= oldest.second)
+            rate = (double)(rateUnit - oldest.second) / span;
         else
             rate = avgRate; // not enough history yet
     }
 
     // ETA uses the overall average, NOT the sliding window: the window reacts to
-    // every /MT burst and makes the estimate jump around uselessly. The average
-    // so far also already accounts for enumeration overhead, which the rest of
-    // the transfer will incur too. Skipped volume is excluded on both sides of
-    // the division — it takes robocopy microseconds, not transfer time.
-    double eta = avgRate > 1 ? (double)(totalReal - realDone) / avgRate : -1;
+    // every burst and makes the estimate jump around uselessly. The average so
+    // far also already accounts for enumeration overhead, which the rest incurs
+    // too. Skipped volume is excluded — it costs microseconds, not time.
+    double eta = avgRate > 1 ? (double)(rateTotal - rateUnit) / avgRate : -1;
 
     // total == 0 means nothing had to be copied (all skipped) — that is
     // complete, not 0%. Likewise the band must read full once finished, even if
@@ -709,11 +775,19 @@ void UpdateUi(UiState* ui) {
     ui->pct = pct;
     ui->rateNow = rate;
 
+    // Colored taskbar-button progress: visible even when the dialog is
+    // minimized or covered. Error state (red) is applied in WM_APP_DONE.
+    if (ui->taskbar && !ui->done) {
+        ui->taskbar->SetProgressState(ui->hwnd, TBPF_NORMAL);
+        ui->taskbar->SetProgressValue(ui->hwnd, done, total ? total : 1);
+    }
+
     // Feed the chart at its own cadence; the 100 ms UI tick would be too
     // noisy. Completion flushes unconditionally: a transfer that finishes
     // within the first interval (e.g. everything already at the destination)
     // would otherwise never write a single bucket and the band would carry no
-    // skip marking at all.
+    // skip marking at all. The curve's height is bytes/sec normally, files/sec
+    // during a delete.
     if (now - ui->lastSampleTick >= CHART_SAMPLE_MS || ui->done) {
         double dt = (now - ui->lastSampleTick) / 1000.0;
         if (dt < 0.001) dt = 0.001;
@@ -721,19 +795,28 @@ void UpdateUi(UiState* ui) {
             (realDone >= ui->lastSampleReal) ? realDone - ui->lastSampleReal : 0;
         unsigned long long dSkip =
             (skipDone >= ui->lastSampleSkip) ? skipDone - ui->lastSampleSkip : 0;
-        RecordSample(ui, pct, (double)dReal / dt, dReal, dSkip);
+        unsigned long long dItems =
+            (dFiles >= ui->lastSampleFiles) ? dFiles - ui->lastSampleFiles : 0;
+        double curveVal = itemsRate ? (double)dItems / dt : (double)dReal / dt;
+        RecordSample(ui, pct, curveVal, itemsRate ? dItems : dReal, dSkip);
         ui->lastSampleTick = now;
         ui->lastSampleReal = realDone;
         ui->lastSampleSkip = skipDone;
+        ui->lastSampleFiles = dFiles;
     }
     InvalidateRect(ui->chart, nullptr, FALSE);
 
     if (ui->done) {
         wchar_t stats[256];
-        StringCchPrintfW(stats, 256, loc::T(loc::S::StatsDone), pct,
-                         HumanBytes(total).c_str(),
-                         HumanBytes((unsigned long long)rate).c_str(), tFiles,
-                         loc::NounFile(tFiles));
+        if (itemsRate)
+            StringCchPrintfW(stats, 256, loc::T(loc::S::StatsDoneItems), pct,
+                             tFiles, loc::NounFile(tFiles),
+                             (unsigned long long)rate);
+        else
+            StringCchPrintfW(stats, 256, loc::T(loc::S::StatsDone), pct,
+                             HumanBytes(total).c_str(),
+                             HumanBytes((unsigned long long)rate).c_str(), tFiles,
+                             loc::NounFile(tFiles));
         SetWindowTextW(ui->lblName, stats);
         SetWindowTextW(ui->lblEta, L"");
         SetWindowTextW(ui->lblRemaining, L"");
@@ -895,6 +978,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetWindowTextW(ui->lblRemaining, L"");
             } else if (code >= 8 || hasErrors) {
                 // code 8 = some files failed but copy continued; still surface it.
+                if (ui->taskbar)
+                    ui->taskbar->SetProgressState(ui->hwnd, TBPF_ERROR); // red
                 SetWindowTextW(ui->lblTitle, loc::T(loc::S::TitleErrors));
                 SetWindowTextW(ui->lblEta, L"");
                 SetWindowTextW(ui->lblRemaining, L"");
@@ -933,6 +1018,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// Ask the always-running tray agent (if present) to pop a "done" balloon on
+// its persistent tray icon. Cross-process WM_COPYDATA; if the agent isn't
+// running the balloon is simply skipped — the runner never grows a tray icon
+// of its own (it exits right after, which would kill the balloon anyway).
+void SendDoneBalloon(const std::wstring& body) {
+    HWND agent = FindWindowW(L"AngelCopyAgentWnd", nullptr);
+    if (!agent) return;
+    COPYDATASTRUCT cds{};
+    cds.dwData = 1; // "show done balloon"
+    cds.cbData = (DWORD)((body.size() + 1) * sizeof(wchar_t));
+    cds.lpData = (PVOID)body.c_str();
+    SendMessageTimeoutW(agent, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG,
+                        1000, nullptr);
+}
+
 // Show the dialog and run `worker` on a background thread until it finishes or
 // the user cancels. Shared by the copy and delete paths.
 // `skipSet`/`dstPrefixes` may be null/empty (the delete path has no robocopy
@@ -941,7 +1041,8 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
           unsigned long long expectedBytes, unsigned long long expectedFiles,
           Conflict policy, SkipInfo skipped,
           const std::unordered_set<std::wstring>* skipSet,
-          std::vector<std::wstring> dstPrefixes, Worker worker) {
+          std::vector<std::wstring> dstPrefixes, Worker worker,
+          bool deleteMode = false) {
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -987,8 +1088,21 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
 
     UiState ui{};
     ui.sh = &sh;
+    ui.hwnd = hwnd;
+    ui.deleteMode = deleteMode;
     ui.skipped = skipped;
     ui.policy = policy;
+
+    // Colored taskbar-button progress (optional; ignored if it can't be had).
+    // COM was not otherwise needed in the runner UI thread — init it here.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_ALL,
+                                   IID_PPV_ARGS(&ui.taskbar)))) {
+        if (FAILED(ui.taskbar->HrInit())) {
+            ui.taskbar->Release();
+            ui.taskbar = nullptr;
+        }
+    }
     ui.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     NONCLIENTMETRICSW ncm{sizeof(ncm)};
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
@@ -1059,13 +1173,194 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
     if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
 
     int code = sh.exitCode;
-    if (InterlockedCompareExchange(&sh.cancel, 0, 0)) code = -1;
+    const bool cancelled = InterlockedCompareExchange(&sh.cancel, 0, 0) != 0;
+    if (cancelled) code = -1;
+
+    // "Done" balloon via the agent — only for a clean run that took long
+    // enough to be worth a notification (quick copies don't earn a popup).
+    double elapsed = (GetTickCount64() - ui.startTick) / 1000.0;
+    if (!cancelled && code < 8 && elapsed >= 3.0) {
+        unsigned long long vol = sh.totalRealBytes ? sh.totalRealBytes
+                                                   : sh.totalBytes;
+        wchar_t body[160];
+        StringCchPrintfW(body, 160, loc::T(loc::S::NotifyDoneBody),
+                         HumanBytes(vol).c_str(), FormatEta(elapsed).c_str());
+        SendDoneBalloon(body);
+    }
+
+    if (ui.taskbar) {
+        ui.taskbar->SetProgressState(hwnd, TBPF_NOPROGRESS);
+        ui.taskbar->Release();
+    }
+    CoUninitialize();
     if (ui.fontBold && ui.fontBold != ui.font) DeleteObject(ui.fontBold);
     if (ui.font && ui.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(ui.font);
     return code;
 }
 
 } // namespace
+
+// ---- "Preparing" window (pre-transfer scan feedback) -----------------------
+
+namespace {
+
+struct ScanUi {
+    ScanProgress* prog = nullptr;
+    HWND lblHead = nullptr, lblCount = nullptr, btnCancel = nullptr;
+    HFONT font = nullptr, fontBold = nullptr;
+    bool done = false;
+    bool shown = false;
+};
+
+constexpr UINT WM_APP_SCAN_DONE = WM_APP + 2;
+constexpr int SCAN_W = 380, SCAN_H = 116;
+
+LRESULT CALLBACK ScanWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    ScanUi* ui = (ScanUi*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, theme::C().text);
+        SetBkColor(dc, theme::C().bg);
+        return (LRESULT)theme::BgBrush();
+    }
+    case WM_DRAWITEM:
+        if (ui) theme::DrawButton((const DRAWITEMSTRUCT*)lp, ui->font);
+        return TRUE;
+    case WM_TIMER:
+        if (ui) {
+            if (wp == 3 && !ui->done && !ui->shown) {
+                // The reveal timer: only a scan still running after ~300 ms
+                // gets a window — small transfers never flash one.
+                ui->shown = true;
+                ShowWindow(hwnd, SW_SHOW);
+            }
+            if (wp == 1 && ui->shown && !ui->done) {
+                wchar_t line[128];
+                unsigned long long n = ui->prog->files.load(std::memory_order_relaxed);
+                StringCchPrintfW(line, 128, loc::T(loc::S::ScanFound), n,
+                                 loc::NounFile(n));
+                SetWindowTextW(ui->lblCount, line);
+            }
+        }
+        return 0;
+    case WM_COMMAND:
+        if (ui && LOWORD(wp) == IDCANCEL && !ui->done) {
+            ui->prog->cancel.store(1);
+            SetWindowTextW(ui->lblHead, loc::T(loc::S::TitleCancelling));
+            EnableWindow(ui->btnCancel, FALSE);
+        }
+        return 0;
+    case WM_CLOSE:
+        // Treat closing like Cancel: stop the scan, then the worker's done
+        // message tears the window down.
+        if (ui && !ui->done) {
+            ui->prog->cancel.store(1);
+            SetWindowTextW(ui->lblHead, loc::T(loc::S::TitleCancelling));
+            EnableWindow(ui->btnCancel, FALSE);
+        }
+        return 0;
+    case WM_APP_SCAN_DONE:
+        if (ui) ui->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, 1);
+        KillTimer(hwnd, 3);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+struct ScanThreadArgs {
+    const std::function<void()>* work;
+    HWND hwnd;
+};
+
+DWORD WINAPI ScanThread(LPVOID p) {
+    ScanThreadArgs* a = (ScanThreadArgs*)p;
+    (*a->work)();
+    PostMessageW(a->hwnd, WM_APP_SCAN_DONE, 0, 0);
+    return 0;
+}
+
+} // namespace
+
+bool RunScanWithUI(ScanProgress& prog, const std::function<void()>& work) {
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = ScanWndProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = theme::BgBrush();
+    wc.lpszClassName = L"AngelCopyScan";
+    RegisterClassW(&wc);
+
+    const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT rc{0, 0, SCAN_W, SCAN_H};
+    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
+    const int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
+                                loc::T(loc::S::CapPreparing), kStyle, sx, sy, W,
+                                H, nullptr, nullptr, hInst, nullptr);
+    if (!hwnd) { work(); return prog.cancel.load() == 0; } // no window: degrade
+
+    ScanUi ui{};
+    ui.prog = &prog;
+    ui.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        ui.font = CreateFontIndirectW(&ncm.lfMessageFont);
+        LOGFONTW bold = ncm.lfMessageFont;
+        bold.lfWeight = FW_SEMIBOLD;
+        ui.fontBold = CreateFontIndirectW(&bold);
+    }
+    if (!ui.fontBold) ui.fontBold = ui.font;
+
+    ui.lblHead = CreateWindowW(L"STATIC", loc::T(loc::S::HeadPreparing),
+        WS_CHILD | WS_VISIBLE, UI_MARGIN, 14, SCAN_W - 2 * UI_MARGIN, 20, hwnd,
+        nullptr, hInst, nullptr);
+    ui.lblCount = CreateWindowW(L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE, UI_MARGIN, 40, SCAN_W - 2 * UI_MARGIN, 18, hwnd,
+        nullptr, hInst, nullptr);
+    ui.btnCancel = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnCancel),
+        WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false),
+        SCAN_W - UI_MARGIN - UI_BTN_W, SCAN_H - UI_BTN_H - 14, UI_BTN_W,
+        UI_BTN_H, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+    SetChildFont(ui.lblHead, ui.fontBold);
+    SetChildFont(ui.lblCount, ui.font);
+    SetChildFont(ui.btnCancel, ui.font);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&ui);
+    theme::ApplyToWindow(hwnd);
+    theme::ApplyToControl(ui.btnCancel);
+
+    SetTimer(hwnd, 1, 100, nullptr); // counter refresh
+    SetTimer(hwnd, 3, 300, nullptr); // reveal delay (anti-flicker)
+
+    ScanThreadArgs args{&work, hwnd};
+    HANDLE th = CreateThread(nullptr, 0, ScanThread, &args, 0, nullptr);
+    if (!th) { // cannot thread: run inline, window stays hidden
+        work();
+        DestroyWindow(hwnd);
+    }
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
+
+    if (ui.fontBold && ui.fontBold != ui.font) DeleteObject(ui.fontBold);
+    if (ui.font && ui.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(ui.font);
+    return prog.cancel.load() == 0;
+}
 
 int RunJobsWithUI(Operation op, const std::wstring& destLabel,
                   const std::vector<RoboJob>& jobs,
@@ -1088,7 +1383,7 @@ int RunJobsWithUI(Operation op, const std::wstring& destLabel,
                  expectedBytes, expectedFiles, policy, skipped, &skipSet,
                  std::move(dstPrefixes),
                  [op, &jobs, policy](Shared& sh) {
-                     return RunRobocopyJobs(sh, op, jobs, policy);
+                     return RunCopyJobs(sh, op, jobs, policy);
                  });
 }
 
@@ -1098,7 +1393,8 @@ int RunDeleteWithUI(const std::vector<std::wstring>& targets,
     return RunUI(loc::T(loc::S::CapDeleting), loc::T(loc::S::HeadDeleting),
                  expectedBytes, expectedFiles, Conflict::Replace, SkipInfo{},
                  nullptr, {},
-                 [&targets](Shared& sh) { return RunDelete(sh, targets); });
+                 [&targets](Shared& sh) { return RunDelete(sh, targets); },
+                 /*deleteMode=*/true);
 }
 
 int RunSyncWithUI(const std::vector<RoboJob>& jobs,
@@ -1119,8 +1415,8 @@ int RunSyncWithUI(const std::vector<RoboJob>& jobs,
                  expectedBytes, expectedFiles, Conflict::Replace, skipped,
                  &skipSet, std::move(dstPrefixes),
                  [&jobs, &extraTargets](Shared& sh) {
-                     int rc = RunRobocopyJobs(sh, Operation::Copy, jobs,
-                                              Conflict::Replace);
+                     int rc = RunCopyJobs(sh, Operation::Copy, jobs,
+                                          Conflict::Replace);
                      if (InterlockedCompareExchange(&sh.cancel, 0, 0)) return rc;
                      if (rc >= 8) return rc; // copy failed: do NOT purge
                      EnterCriticalSection(&sh.cs);

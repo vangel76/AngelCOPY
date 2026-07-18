@@ -1,4 +1,5 @@
 #pragma once
+#include "Robocopy.h" // ScanProgress
 #include <functional>
 #include <string>
 #include <vector>
@@ -21,7 +22,9 @@ struct DeleteScan {
 };
 
 // Count what would be deleted (recursive, does not follow junctions).
-DeleteScan ScanDelete(const std::vector<std::wstring>& targets);
+// `prog` (optional) feeds the "Preparing" window and allows cancellation.
+DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
+                      ScanProgress* prog = nullptr);
 
 struct DeleteSink {
     std::function<void(const std::wstring& path, unsigned long long size)> onFile;

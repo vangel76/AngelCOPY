@@ -1,0 +1,12 @@
+MODULE    = robocopy.exe
+IMPORTS   = advapi32
+DELAYIMPORTS = user32
+
+EXTRADLLFLAGS = -mconsole -municode -mno-cygwin
+
+C_SRCS = \
+	robocopy.c \
+	output.c \
+	getopt_dos.c
+
+RC_SRCS = robocopy.rc

@@ -75,17 +75,25 @@ IFACEMETHODIMP CContextMenu::QueryContextMenu(HMENU hMenu, UINT indexMenu,
     // does, byte for byte (CF_HDROP + PreferredDropEffect) — the speed lives
     // entirely in the paste. Removed as pointless in July 2026.
 
-    if (!m_pasteTarget.empty() && angel::ClipboardHasHDrop() && id <= idCmdLast) {
+    std::vector<std::wstring> clip;
+    DWORD effect = 0;
+    if (!m_pasteTarget.empty() && id <= idCmdLast &&
+        angel::GetClipboardHDrop(clip, effect) && !clip.empty()) {
+        // The label states the verb, not a generic "Paste": after Ctrl+X this
+        // entry MOVES, after Ctrl+C it copies — the user must see which one
+        // they are about to get. (Invoke re-reads the clipboard, so a stale
+        // label can't change what actually happens — it only mislabels; both
+        // read the same PreferredDropEffect.)
+        m_pasteIsMove = (effect & DROPEFFECT_MOVE) != 0;
         InsertMenuW(hMenu, pos, MF_BYPOSITION | MF_STRING, id,
-                    loc::T(loc::S::MenuPaste));
+                    loc::T(m_pasteIsMove ? loc::S::MenuMoveHere
+                                         : loc::S::MenuCopyHere));
         m_idPaste = id - idCmdFirst;
         ++id; ++pos; ++added;
 
-        // Mirror: only next to Paste FAST, and only when the clipboard holds
-        // at least one folder — mirroring is a folder operation.
-        std::vector<std::wstring> clip;
-        DWORD effect = 0;
-        if (angel::GetClipboardHDrop(clip, effect) && id <= idCmdLast) {
+        // Mirror: only next to the paste entry, and only when the clipboard
+        // holds at least one folder — mirroring is a folder operation.
+        if (id <= idCmdLast) {
             for (const auto& p : clip) {
                 if (PathIsDirectoryW(p.c_str())) {
                     InsertMenuW(hMenu, pos, MF_BYPOSITION | MF_STRING, id,
@@ -148,7 +156,9 @@ IFACEMETHODIMP CContextMenu::GetCommandString(UINT_PTR idCmd, UINT uType, UINT*,
         return E_INVALIDARG;
 
     const wchar_t* help = nullptr;
-    if (idCmd == m_idPaste)  help = loc::T(loc::S::HelpPaste);
+    if (idCmd == m_idPaste)
+        help = loc::T(m_pasteIsMove ? loc::S::HelpMoveHere
+                                    : loc::S::HelpCopyHere);
     if (idCmd == m_idSync)   help = loc::T(loc::S::HelpSyncHere);
     if (idCmd == m_idDelete) help = loc::T(loc::S::HelpDelete);
     if (!help) return E_INVALIDARG;

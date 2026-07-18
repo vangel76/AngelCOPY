@@ -11,9 +11,9 @@ const wchar_t* kEn[] = {
     L"Move here FAST (AngelCOPY)",
     L"Paste FAST (AngelCOPY)",
     L"Delete FAST (AngelCOPY)",
-    L"Copy here using robocopy /MT:64",
-    L"Move here using robocopy /MT:64",
-    L"Paste here using robocopy /MT:64",
+    L"Copy here with the AngelCOPY engine",
+    L"Move here with the AngelCOPY engine",
+    L"Paste here with the AngelCOPY engine",
     L"Delete permanently (no Recycle Bin), asks first",
     // progress
     L"AngelCOPY \x2014 Copying",
@@ -64,7 +64,7 @@ const wchar_t* kEn[] = {
     L"calculating\x2026",
     // mirror
     L"Mirror here FAST (AngelCOPY)",
-    L"Make this folder an exact copy of the source (robocopy /MT:64, deletes extras)",
+    L"Make this folder an exact copy of the source (AngelCOPY engine, deletes extras)",
     L"AngelCOPY \x2014 Mirroring",
     L"Mirroring items\x2026",
     L"AngelCOPY \x2014 Confirm mirror",
@@ -82,6 +82,21 @@ const wchar_t* kEn[] = {
     L"The estimate ignores compression and deduplication, so it may still fit. "
     L"Proceeding risks a partial copy if it does not.",
     L"Try anyway",
+    // preparing
+    L"AngelCOPY \x2014 Preparing",
+    L"Analyzing folders\x2026",
+    L"%llu %s found so far",
+    // agent
+    L"AngelCOPY \x2014 Explorer shortcuts",
+    L"Intercept Ctrl+V and Shift+Del in Explorer",
+    L"Exit",
+    // same-folder copy
+    L"Copy",
+    // completion balloon
+    L"Done \x2014 %s in %s",
+    // delete rate
+    L"%llu items/s",
+    L"%d%%   \x2022   %llu %s   \x2022   %llu items/s average",
 };
 
 const wchar_t* kDe[] = {
@@ -90,9 +105,9 @@ const wchar_t* kDe[] = {
     L"Hierher verschieben FAST (AngelCOPY)",
     L"Einfügen FAST (AngelCOPY)",
     L"Löschen FAST (AngelCOPY)",
-    L"Hierher kopieren mit robocopy /MT:64",
-    L"Hierher verschieben mit robocopy /MT:64",
-    L"Hier einfügen mit robocopy /MT:64",
+    L"Hierher kopieren mit der AngelCOPY-Engine",
+    L"Hierher verschieben mit der AngelCOPY-Engine",
+    L"Hier einfügen mit der AngelCOPY-Engine",
     L"Endgültig löschen (kein Papierkorb), fragt vorher",
     // progress
     L"AngelCOPY \x2014 Kopieren",
@@ -143,7 +158,7 @@ const wchar_t* kDe[] = {
     L"wird berechnet\x2026",
     // mirror
     L"Hierher spiegeln FAST (AngelCOPY)",
-    L"Ordner wird exakte Kopie der Quelle (robocopy /MT:64, löscht Überzähliges)",
+    L"Ordner wird exakte Kopie der Quelle (AngelCOPY-Engine, löscht Überzähliges)",
     L"AngelCOPY \x2014 Spiegeln",
     L"Elemente werden gespiegelt\x2026",
     L"AngelCOPY \x2014 Spiegeln bestätigen",
@@ -162,6 +177,21 @@ const wchar_t* kDe[] = {
     L"könnte also doch passen. Fortfahren riskiert eine unvollständige Kopie, "
     L"falls nicht.",
     L"Trotzdem versuchen",
+    // preparing
+    L"AngelCOPY \x2014 Vorbereiten",
+    L"Ordner werden analysiert\x2026",
+    L"Bisher %llu %s gefunden",
+    // agent
+    L"AngelCOPY \x2014 Explorer-Tastenkürzel",
+    L"Strg+V und Umschalt+Entf im Explorer abfangen",
+    L"Beenden",
+    // same-folder copy
+    L"Kopie",
+    // completion balloon
+    L"Fertig \x2014 %s in %s",
+    // delete rate
+    L"%llu Elem./s",
+    L"%d%%   \x2022   %llu %s   \x2022   %llu Elem./s Durchschnitt",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");

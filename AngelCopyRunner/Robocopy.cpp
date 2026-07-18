@@ -59,14 +59,45 @@ std::wstring LowerCopy(std::wstring s) {
     return s;
 }
 
+bool SamePath(const std::wstring& a, const std::wstring& b) {
+    return LowerCopy(StripTrailingSep(a)) == LowerCopy(StripTrailingSep(b));
+}
+
+bool Exists(const std::wstring& p) {
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Windows-style "<stem> - <copyWord><ext>", bumped to " (2)", " (3)" … until
+// the name is free in `dir`. For files the extension is the last dot (so
+// "a.tar.gz" -> "a.tar - Kopie.gz", matching Explorer); folders have none.
+std::wstring UniqueCopyName(const std::wstring& dir, const std::wstring& name,
+                            bool isDir, const std::wstring& copyWord) {
+    std::wstring stem = name, ext;
+    if (!isDir) {
+        size_t dot = name.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot != 0) {
+            stem = name.substr(0, dot);
+            ext = name.substr(dot);
+        }
+    }
+    for (int n = 1;; ++n) {
+        std::wstring cand = stem + L" - " + copyWord;
+        if (n > 1) cand += L" (" + std::to_wstring(n) + L")";
+        cand += ext;
+        if (!Exists(JoinPath(dir, cand))) return cand;
+    }
+}
+
 } // namespace
 
-std::vector<RoboJob> PlanJobs(Operation /*op*/,
+std::vector<RoboJob> PlanJobs(Operation op,
                               const std::wstring& destDir,
-                              const std::vector<std::wstring>& sources) {
+                              const std::vector<std::wstring>& sources,
+                              const std::wstring& copyWord) {
     std::vector<RoboJob> jobs;
     // parent-dir(lowercased) -> index into `jobs` for grouped loose files
     std::map<std::wstring, size_t> fileGroups;
+    const bool isCopy = (op == Operation::Copy);
 
     for (const auto& raw : sources) {
         std::wstring src = StripTrailingSep(raw);
@@ -76,23 +107,48 @@ std::vector<RoboJob> PlanJobs(Operation /*op*/,
             // Whole-tree copy: C:\a\sub  ->  dest\sub
             RoboJob job;
             job.srcDir = src;
-            job.dstDir = JoinPath(destDir, BaseName(src));
+            std::wstring dst = JoinPath(destDir, BaseName(src));
+            if (SamePath(dst, src)) {
+                // Pasting a folder into its own parent. A move onto itself is a
+                // no-op — drop it; a copy becomes "<name> - Kopie".
+                if (!isCopy) continue;
+                dst = JoinPath(destDir,
+                               UniqueCopyName(destDir, BaseName(src), true, copyWord));
+            }
+            job.dstDir = std::move(dst);
             jobs.push_back(std::move(job));
         } else {
-            // Loose file: group by parent directory so files sharing a folder
-            // become one robocopy call with multiple file filters.
             std::wstring parent = ParentDir(src);
+            std::wstring dstDir = StripTrailingSep(destDir);
+            std::wstring name = BaseName(src);
+
+            if (SamePath(parent, dstDir)) {
+                // Same-folder paste of a loose file. Move onto itself: nothing
+                // to do. Copy: emit an own job with a renamed destination.
+                if (!isCopy) continue;
+                RoboJob job;
+                job.srcDir = parent;
+                job.dstDir = dstDir;
+                job.files.push_back(name);
+                job.dstNames.push_back(
+                    UniqueCopyName(dstDir, name, false, copyWord));
+                jobs.push_back(std::move(job));
+                continue;
+            }
+
+            // Different folder: group by parent directory so files sharing a
+            // folder become one job with multiple file filters.
             std::wstring key = LowerCopy(parent);
             auto it = fileGroups.find(key);
             if (it == fileGroups.end()) {
                 RoboJob job;
                 job.srcDir = parent;
-                job.dstDir = StripTrailingSep(destDir);
-                job.files.push_back(BaseName(src));
+                job.dstDir = dstDir;
+                job.files.push_back(name);
                 fileGroups[key] = jobs.size();
                 jobs.push_back(std::move(job));
             } else {
-                jobs[it->second].files.push_back(BaseName(src));
+                jobs[it->second].files.push_back(name);
             }
         }
     }
@@ -175,16 +231,14 @@ unsigned long long FileTimeToU64(const FILETIME& ft) {
     return ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
-// How robocopy will treat a source file given what's at the destination.
-enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
-
 constexpr unsigned long long kTimeTolerance = 20000000ULL; // 2s in 100ns ticks
 
-// Mirrors robocopy's own comparison: identical == same size and write-time
-// within 2s (FAT/network timestamp granularity). Fills `dstSize` (0 when the
-// destination file is absent) so the caller can compute overwrite growth.
-FileClass Classify(const std::wstring& dst, unsigned long long srcSize,
-                   const FILETIME& srcTime, unsigned long long& dstSize) {
+} // namespace
+
+// Definition lives in Robocopy.cpp next to the scan that depends on it; the
+// declaration is public (Robocopy.h) for the native engine.
+FileClass ClassifyFile(const std::wstring& dst, unsigned long long srcSize,
+                       const FILETIME& srcTime, unsigned long long& dstSize) {
     dstSize = 0;
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     if (!GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &fa))
@@ -201,6 +255,8 @@ FileClass Classify(const std::wstring& dst, unsigned long long srcSize,
     if (b > a && diff > kTimeTolerance) return FileClass::DiffOlder;
     return FileClass::DiffNewer;
 }
+
+namespace {
 
 void Account(ScanResult& acc, FileClass fc, unsigned long long size,
              unsigned long long dstSize, const std::wstring& src,
@@ -231,12 +287,13 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
 }
 
 void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
-              ScanResult& acc) {
+              ScanResult& acc, ScanProgress* prog) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((srcDir + L"\\*").c_str(), FindExInfoBasic, &fd,
                                 FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
+        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
             continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue; // /XJ
@@ -245,12 +302,13 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
         std::wstring dst = dstDir + L"\\" + fd.cFileName;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ScanTree(src, dst, acc);
+            ScanTree(src, dst, acc, prog);
         } else {
+            if (prog) prog->files.fetch_add(1, std::memory_order_relaxed);
             unsigned long long size =
                 ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             unsigned long long dstSize = 0;
-            FileClass fc = Classify(dst, size, fd.ftLastWriteTime, dstSize);
+            FileClass fc = ClassifyFile(dst, size, fd.ftLastWriteTime, dstSize);
             Account(acc, fc, size, dstSize, src, dst);
         }
     } while (FindNextFileW(h, &fd));
@@ -259,23 +317,27 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
 
 } // namespace
 
-ScanResult ScanJobs(const std::vector<RoboJob>& jobs) {
+ScanResult ScanJobs(const std::vector<RoboJob>& jobs, ScanProgress* prog) {
     ScanResult r;
     for (const RoboJob& job : jobs) {
+        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (job.files.empty()) {
             // Whole-tree job: srcDir maps onto dstDir.
-            ScanTree(job.srcDir, job.dstDir, r);
+            ScanTree(job.srcDir, job.dstDir, r, prog);
         } else {
-            for (const auto& f : job.files) {
+            for (size_t i = 0; i < job.files.size(); ++i) {
+                const std::wstring& f = job.files[i];
+                if (prog) prog->files.fetch_add(1, std::memory_order_relaxed);
                 std::wstring src = job.srcDir + L"\\" + f;
-                std::wstring dst = job.dstDir + L"\\" + f;
+                std::wstring dst = job.dstDir + L"\\" +
+                    (i < job.dstNames.size() ? job.dstNames[i] : f);
                 WIN32_FILE_ATTRIBUTE_DATA fa{};
                 if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa))
                     continue;
                 unsigned long long size =
                     ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
                 unsigned long long dstSize = 0;
-                FileClass fc = Classify(dst, size, fa.ftLastWriteTime, dstSize);
+                FileClass fc = ClassifyFile(dst, size, fa.ftLastWriteTime, dstSize);
                 Account(r, fc, size, dstSize, src, dst);
             }
         }
@@ -316,14 +378,17 @@ namespace {
 // are real directories — a reparse point at the destination is either an
 // extra (deleted as a link) or left alone, never entered.
 void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
-                std::vector<std::wstring>& out) {
+                std::vector<std::wstring>& out, ScanProgress* prog) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((dstDir + L"\\*").c_str(), FindExInfoBasic, &fd,
                                 FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
+        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
             continue;
+        if (prog && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            prog->files.fetch_add(1, std::memory_order_relaxed);
 
         std::wstring dst = dstDir + L"\\" + fd.cFileName;
         std::wstring src = srcDir + L"\\" + fd.cFileName;
@@ -342,19 +407,21 @@ void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
             out.push_back(dst);
             continue;
         }
-        if (dstIsDir && !dstIsLink) FindExtras(src, dst, out);
+        if (dstIsDir && !dstIsLink) FindExtras(src, dst, out, prog);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
 } // namespace
 
-std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs) {
+std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs,
+                                     ScanProgress* prog) {
     std::vector<std::wstring> extras;
     for (const RoboJob& job : jobs) {
+        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (!job.files.empty()) continue; // loose files: plain copy, no purge
         if (!IsDirectory(job.dstDir)) continue; // nothing there yet
-        FindExtras(job.srcDir, job.dstDir, extras);
+        FindExtras(job.srcDir, job.dstDir, extras, prog);
     }
     return extras;
 }

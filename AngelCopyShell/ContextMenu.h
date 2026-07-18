@@ -37,6 +37,11 @@ private:
     std::vector<std::wstring> m_sources;  // selected items (Delete FAST target)
     std::wstring m_pasteTarget;           // folder for Paste FAST ("" if none)
 
+    // Clipboard verb at menu-build time: after Ctrl+X the entry reads
+    // "Move here FAST", after Ctrl+C "Copy here FAST" — the label must say
+    // what will actually happen (invoke re-reads the clipboard anyway).
+    bool m_pasteIsMove = false;
+
     // Command offsets from idCmdFirst; 0xFFFFFFFF when the item isn't shown.
     UINT m_idPaste = 0xFFFFFFFF;
     UINT m_idSync = 0xFFFFFFFF;  // mirror clipboard folders into the target

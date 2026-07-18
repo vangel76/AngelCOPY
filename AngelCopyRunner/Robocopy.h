@@ -1,9 +1,21 @@
 #pragma once
+#include <windows.h>
+#include <atomic>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace angelcopy {
+
+// Live feedback + cancellation for the pre-transfer scans. On a 500k-file
+// tree the destination comparison takes seconds; the GUI shows a "Preparing"
+// window (RunScanWithUI) that reads `files` while the scan runs on a worker
+// thread. Setting `cancel` aborts the walk early — the partial result must
+// then be discarded by the caller.
+struct ScanProgress {
+    std::atomic<unsigned long long> files{0};
+    std::atomic<long> cancel{0};
+};
 
 enum class Operation { Copy, Move };
 
@@ -22,14 +34,25 @@ struct RoboJob {
     std::wstring srcDir;
     std::wstring dstDir;
     std::vector<std::wstring> files; // empty => whole-tree copy
+    // Parallel to `files`: destination filename for each, when it must differ
+    // from the source name (same-folder copy → "x - Kopie"). Empty vector =>
+    // every file keeps its name. Whole-tree self-copy is handled by renaming
+    // dstDir instead, so this stays empty there.
+    std::vector<std::wstring> dstNames;
 };
 
 // Turn (operation, destination, sources) into a minimal set of robocopy jobs.
 // Directories each become their own whole-tree job; loose files are grouped by
 // parent directory so same-folder files share a single robocopy call.
+// `copyWord` is the localized word for a same-folder copy ("Kopie"/"Copy"):
+// pasting an item into the folder it already lives in produces
+// "<name> - <copyWord>" instead of colliding with itself (Explorer behavior).
+// Passed in (not looked up) so Robocopy.cpp stays free of the Localize
+// dependency the unit tests don't link.
 std::vector<RoboJob> PlanJobs(Operation op,
                               const std::wstring& destDir,
-                              const std::vector<std::wstring>& sources);
+                              const std::vector<std::wstring>& sources,
+                              const std::wstring& copyWord = L"Copy");
 
 // Build the robocopy.exe argument string (everything after the exe path) for a
 // job. `parseable` selects the machine-readable flag set (/BYTES /FP /NC ...)
@@ -66,7 +89,19 @@ struct ScanResult {
     // two line kinds are textually identical — only the path says which is which.
     std::vector<std::wstring> samePaths, newerPaths, olderPaths;
 };
-ScanResult ScanJobs(const std::vector<RoboJob>& jobs);
+ScanResult ScanJobs(const std::vector<RoboJob>& jobs,
+                    ScanProgress* prog = nullptr);
+
+// How robocopy will treat a source file given what's at the destination.
+// Public because the native engine (NativeCopy.cpp) must make the exact same
+// per-file decision the scan made, or totals and outcomes drift apart.
+enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
+
+// Mirrors robocopy's own comparison: identical == same size and write-time
+// within 2s (FAT/network timestamp granularity). Fills `dstSize` (0 when the
+// destination file is absent) so the caller can compute overwrite growth.
+FileClass ClassifyFile(const std::wstring& dst, unsigned long long srcSize,
+                       const FILETIME& srcTime, unsigned long long& dstSize);
 
 // The exact set of (lowercased) source paths robocopy will list but NOT copy
 // under `policy` — same files always, plus the policy-excluded classes.
@@ -80,7 +115,8 @@ std::unordered_set<std::wstring> SkipSetFor(const ScanResult& s, Conflict policy
 // are returned as targets but never recursed into — the deleter removes the
 // link itself, not what it points at. Returned paths are top-level extras;
 // count/measure them with ScanDelete before prompting.
-std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs);
+std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs,
+                                     ScanProgress* prog = nullptr);
 
 // Bytes/files robocopy will actually copy under `policy` — this is what the
 // progress bar must be scaled against, otherwise it never reaches 100%.
