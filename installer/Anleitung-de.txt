@@ -1,0 +1,38 @@
+﻿ANGELCOPY — KURZANLEITUNG
+=========================
+
+KOPIEREN & EINFÜGEN
+  1. Dateien/Ordner wie gewohnt kopieren (Strg+C) oder ausschneiden (Strg+X).
+  2. Im Zielordner einfügen:
+     • Strg+V — AngelCOPY übernimmt automatisch, oder
+     • Rechtsklick → „Einfügen FAST (AngelCOPY)".
+  Ausschneiden + Einfügen = schnelles Verschieben.
+
+DRAG & DROP
+  Dateien/Ordner mit der RECHTEN Maustaste auf das Ziel ziehen:
+  „Hierher kopieren FAST" / „Hierher verschieben FAST" / „Hierher spiegeln FAST".
+  (Ziehen mit links bleibt Windows-Standard — dafür bietet Windows
+  keinen Ansatzpunkt.)
+
+SPIEGELN
+  Das Ziel wird eine exakte Kopie der Quelle: Neues und Geändertes wird
+  kopiert, alles Überzählige am Ziel wird GELÖSCHT. Ein Dialog zeigt vorher
+  genau, was kopiert und was gelöscht wird — Abbrechen ist die Vorauswahl.
+
+LÖSCHEN
+  Auswahl → Rechtsklick „Löschen FAST" oder Umschalt+Entf.
+  Endgültig, KEIN Papierkorb — es wird immer vorher gefragt.
+
+DER FORTSCHRITTSDIALOG
+  • Grüne Abschnitte im Balken = übersprungen (am Ziel schon aktuell).
+  • Geschwindigkeit und Restzeit zählen nur echt kopierte Daten.
+  • Häkchen „Fenster nach Abschluss geöffnet lassen": Dialog bleibt mit
+    Statistik inkl. Gesamtdauer stehen. Die Wahl wird global gemerkt.
+  • Bei Konflikten fragt AngelCOPY: Ersetzen / Nur neuere / Überspringen.
+
+WINDOWS 11
+  Die Einträge stehen unter „Weitere Optionen anzeigen" (Umschalt+F10) —
+  außer, die klassische Menü-Option wurde bei der Installation aktiviert.
+
+Diese Anleitung jederzeit: Startmenü → AngelCOPY → „AngelCOPY Anleitung"
+(oder in der Windows-Suche „AngelCOPY Anleitung" tippen)

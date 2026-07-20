@@ -48,12 +48,17 @@ bool ReadString(HKEY root, const std::wstring& subkey, const wchar_t* name,
     HKEY h;
     if (RegOpenKeyExW(root, subkey.c_str(), 0, KEY_READ, &h) != ERROR_SUCCESS)
         return false;
-    wchar_t buf[512];
-    DWORD cb = sizeof(buf), type = 0;
+    wchar_t buf[512]{};
+    DWORD cb = sizeof(buf) - sizeof(wchar_t), type = 0; // leave room for a NUL
     LONG r = RegQueryValueExW(h, name, nullptr, &type,
                               reinterpret_cast<BYTE*>(buf), &cb);
     RegCloseKey(h);
     if (r != ERROR_SUCCESS || type != REG_SZ) return false;
+    // RegQueryValueEx does not guarantee NUL-termination; terminate at the
+    // returned length so out.assign never scans past the buffer.
+    size_t n = cb / sizeof(wchar_t);
+    if (n >= 512) n = 511;
+    buf[n] = L'\0';
     out.assign(buf);
     return true;
 }

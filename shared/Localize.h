@@ -22,7 +22,7 @@ enum class S {
     // ---- progress dialog ----
     CapCopying, CapMoving, CapDeleting,
     HeadCopying, HeadMoving, HeadDeleting,
-    StatsDone,         // pct, total, rate, totalFiles, noun
+    StatsDone,         // pct, total, rate, totalFiles, noun, duration
     TitleDone,
     TitleDoneSkipped,  // count, noun
     TitleErrors, TitleCancelled, TitleCancelling,
@@ -102,7 +102,17 @@ enum class S {
 
     // ---- delete: rate in items/sec, not bytes/sec ----
     ChartSpeedItems,   // count        (live speed label, delete/purge)
-    StatsDoneItems,    // pct, count, noun, rate  (final summary, delete/purge)
+    StatsDoneItems,    // pct, count, noun, rate, duration (final summary, delete/purge)
+
+    // ---- keep-open checkbox (progress dialog, persisted in HKCU) ----
+    ChkKeepOpen,
+
+    // ---- mirror completion summary ----
+    SyncStatsDone,     // pct, bytes, rate, files, noun, deletedItems, duration
+
+    // ---- volume queue (serialize transfers on a shared drive) ----
+    HeadWaiting,       // heading while queued behind another transfer
+    BtnStartAnyway,    // "run in parallel this once"
 
     COUNT
 };

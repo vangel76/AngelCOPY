@@ -122,6 +122,39 @@ int wmain() {
         check(extras.empty(), "no destination -> no extras");
     }
 
+    // Regression: a SOURCE-side junction must never be traversed. The copy
+    // phase skips source junctions, so descending into one here would compare
+    // the destination against the LINK TARGET's contents and purge whatever
+    // the target doesn't have — destination data loss driven by a link the
+    // copy never followed.
+    printf("Source-side junction is never traversed:\n");
+    {
+        // src\m\linked  ->  junction to src\elsewhere (which holds only far.txt)
+        // dst\m\linked  ->  a real directory holding mine.txt
+        CreateDirectoryW((root + L"\\src\\elsewhere").c_str(), nullptr);
+        WriteText(root + L"\\src\\elsewhere\\far.txt", "far");
+        CreateDirectoryW((root + L"\\dst\\m\\linked").c_str(), nullptr);
+        WriteText(root + L"\\dst\\m\\linked\\mine.txt", "mine");
+
+        std::wstring mk = L"cmd /c mklink /J \"" + root + L"\\src\\m\\linked\" \"" +
+                          root + L"\\src\\elsewhere\" >nul 2>&1";
+        _wsystem(mk.c_str());
+
+        DWORD la = GetFileAttributesW((root + L"\\src\\m\\linked").c_str());
+        bool haveLink = (la != INVALID_FILE_ATTRIBUTES) &&
+                        (la & FILE_ATTRIBUTE_REPARSE_POINT);
+        check(haveLink, "  (setup) source junction created");
+
+        std::vector<std::wstring> sources{root + L"\\src\\m"};
+        auto jobs = PlanJobs(Operation::Copy, root + L"\\dst", sources);
+        auto extras = ScanExtras(jobs);
+        // mine.txt lives under the destination twin of a SOURCE junction. It is
+        // absent from the junction target, so an un-guarded walk would list it
+        // for deletion. It must not appear.
+        check(!Contains(extras, L"\\dst\\m\\linked\\mine.txt"),
+              "file under a source-junction twin is NOT purged");
+    }
+
     RmTree(root);
     printf("\n%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

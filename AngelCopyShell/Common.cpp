@@ -16,8 +16,12 @@ namespace angel {
 
 std::wstring ModuleDir() {
     wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(g_hModule, path, MAX_PATH);
-    std::wstring p(path);
+    DWORD n = GetModuleFileNameW(g_hModule, path, MAX_PATH);
+    // n == MAX_PATH means the name was truncated and may not be NUL-terminated
+    // (and ERROR_INSUFFICIENT_BUFFER is set). Treat as failure rather than read
+    // an unterminated buffer. A Program Files install never hits this.
+    if (n == 0 || n >= MAX_PATH) return L"";
+    std::wstring p(path, n);
     size_t slash = p.find_last_of(L"\\/");
     return (slash == std::wstring::npos) ? L"" : p.substr(0, slash);
 }
@@ -39,6 +43,16 @@ bool GetHDropPaths(IDataObject* pdo, std::vector<std::wstring>& out) {
     FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM stg{};
     if (FAILED(pdo->GetData(&fmt, &stg))) return false;
+
+    // A hostile drag source can return a different medium, or an HGLOBAL too
+    // small to hold a DROPFILES header. DragQueryFileW trusts the header's
+    // pFiles offset, so an undersized block walks past the allocation — inside
+    // explorer.exe, where this DLL lives.
+    if (stg.tymed != TYMED_HGLOBAL || !stg.hGlobal ||
+        GlobalSize(stg.hGlobal) < sizeof(DROPFILES)) {
+        ReleaseStgMedium(&stg);
+        return false;
+    }
 
     bool ok = false;
     HDROP hDrop = static_cast<HDROP>(GlobalLock(stg.hGlobal));
@@ -66,10 +80,12 @@ DWORD GetPreferredDropEffect(IDataObject* pdo) {
     if (FAILED(pdo->GetData(&fmt, &stg))) return 0;
     DWORD effect = 0;
     void* p = GlobalLock(stg.hGlobal);
-    if (p) {
+    // A crafted IDataObject can hand back a block smaller than a DWORD; reading
+    // 4 bytes from it would run past the allocation (a fault inside Explorer).
+    if (p && GlobalSize(stg.hGlobal) >= sizeof(DWORD)) {
         effect = *reinterpret_cast<DWORD*>(p);
-        GlobalUnlock(stg.hGlobal);
     }
+    if (p) GlobalUnlock(stg.hGlobal);
     ReleaseStgMedium(&stg);
     return effect;
 }
@@ -84,7 +100,9 @@ bool GetClipboardHDrop(std::vector<std::wstring>& out, DWORD& effect) {
 
     bool ok = false;
     HANDLE h = GetClipboardData(CF_HDROP);
-    if (h) {
+    // Same guard as GetHDropPaths: any process can put a short CF_HDROP block
+    // on the clipboard, and DragQueryFileW would read past it.
+    if (h && GlobalSize(h) >= sizeof(DROPFILES)) {
         HDROP hDrop = static_cast<HDROP>(GlobalLock(h));
         if (hDrop) {
             UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
@@ -103,13 +121,39 @@ bool GetClipboardHDrop(std::vector<std::wstring>& out, DWORD& effect) {
     HANDLE he = GetClipboardData(cf);
     if (he) {
         void* p = GlobalLock(he);
-        if (p) { effect = *reinterpret_cast<DWORD*>(p); GlobalUnlock(he); }
+        if (p && GlobalSize(he) >= sizeof(DWORD))
+            effect = *reinterpret_cast<DWORD*>(p);
+        if (p) GlobalUnlock(he);
     }
     CloseClipboard();
     return ok;
 }
 
 // ---- Runner launch ----
+
+// Quote one command-line argument. Windows filenames cannot contain a double
+// quote, so the only hazard is a path ending in backslash(es): "C:\" makes the
+// closing quote escaped (\") and merges the next argument in. Double the run of
+// trailing backslashes so the terminator survives (the canonical MSVCRT rule).
+static std::wstring QuoteArg(const std::wstring& s) {
+    size_t tail = 0;
+    while (tail < s.size() && s[s.size() - 1 - tail] == L'\\') ++tail;
+    return L"\"" + s + std::wstring(tail, L'\\') + L"\"";
+}
+
+// Returns true only if the whole buffer was written (a short write on a full
+// disk would truncate the source list and silently drop items).
+static bool WriteAll(HANDLE h, const void* data, DWORD bytes) {
+    const BYTE* p = static_cast<const BYTE*>(data);
+    while (bytes) {
+        DWORD n = 0;
+        if (!WriteFile(h, p, bytes, &n, nullptr) || n == 0) return false;
+        p += n;
+        bytes -= n;
+    }
+    return true;
+}
+
 static std::wstring WriteTempList(const std::vector<std::wstring>& sources) {
     wchar_t tmpDir[MAX_PATH]{};
     if (!GetTempPathW(MAX_PATH, tmpDir)) return L"";
@@ -118,17 +162,20 @@ static std::wstring WriteTempList(const std::vector<std::wstring>& sources) {
 
     HANDLE h = CreateFileW(tmpFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return L"";
+    // GetTempFileNameW already CREATED the file, so a failed open must clean it
+    // up or a 0-byte acpXXXX.tmp is left behind on every failure.
+    if (h == INVALID_HANDLE_VALUE) { DeleteFileW(tmpFile); return L""; }
 
-    DWORD written = 0;
+    bool ok = true;
     const wchar_t bom = 0xFEFF;
-    WriteFile(h, &bom, sizeof(bom), &written, nullptr);
+    ok = WriteAll(h, &bom, sizeof(bom));
     for (const auto& s : sources) {
-        WriteFile(h, s.c_str(), (DWORD)(s.size() * sizeof(wchar_t)), &written, nullptr);
-        const wchar_t nl = L'\n';
-        WriteFile(h, &nl, sizeof(nl), &written, nullptr);
+        if (!ok) break;
+        ok = WriteAll(h, s.c_str(), (DWORD)(s.size() * sizeof(wchar_t))) &&
+             WriteAll(h, L"\n", sizeof(wchar_t));
     }
     CloseHandle(h);
+    if (!ok) { DeleteFileW(tmpFile); return L""; } // truncated -> don't use it
     return tmpFile;
 }
 
@@ -145,11 +192,13 @@ bool LaunchRunner(const wchar_t* op, const std::wstring& dest,
     if (list.empty()) return false;
 
     // "<runner>" <copy|move> "<dest>" "@<list>"   /   "<runner>" delete "@<list>"
-    std::wstring cmd = L"\"" + runner + L"\" ";
+    // Every path is quoted with QuoteArg so a drive-root target ("D:\") can't
+    // escape its quote and swallow the @list argument.
+    std::wstring cmd = QuoteArg(runner) + L" ";
     cmd += op;
     cmd += L" ";
-    if (!isDelete) cmd += L"\"" + dest + L"\" ";
-    cmd += L"\"@" + list + L"\"";
+    if (!isDelete) cmd += QuoteArg(dest) + L" ";
+    cmd += QuoteArg(L"@" + list);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -163,6 +212,9 @@ bool LaunchRunner(const wchar_t* op, const std::wstring& dest,
     if (ok) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+    } else {
+        // The runner consumes+deletes the list; if it never starts, we must.
+        DeleteFileW(list.c_str());
     }
     return ok != FALSE;
 }

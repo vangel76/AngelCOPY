@@ -22,7 +22,7 @@ const wchar_t* kEn[] = {
     L"Copying items\x2026",
     L"Moving items\x2026",
     L"Deleting permanently\x2026",
-    L"%d%%   \x2022   %s   \x2022   %s/s average   \x2022   %llu %s",
+    L"%d%%   \x2022   %s   \x2022   %s/s average   \x2022   %llu %s   \x2022   %s",
     L"Done",
     L"Done \x2014 %llu %s skipped",
     L"Finished with errors",
@@ -96,7 +96,14 @@ const wchar_t* kEn[] = {
     L"Done \x2014 %s in %s",
     // delete rate
     L"%llu items/s",
-    L"%d%%   \x2022   %llu %s   \x2022   %llu items/s average",
+    L"%d%%   \x2022   %llu %s   \x2022   %llu items/s average   \x2022   %s",
+    // keep-open checkbox
+    L"Keep window open when done",
+    // mirror completion summary
+    L"%d%%   \x2022   %s   \x2022   %s/s average   \x2022   %llu %s   \x2022   %llu deleted   \x2022   %s",
+    // volume queue
+    L"Waiting for another AngelCOPY transfer on the same drive\x2026",
+    L"Start anyway (run in parallel)",
 };
 
 const wchar_t* kDe[] = {
@@ -116,7 +123,7 @@ const wchar_t* kDe[] = {
     L"Elemente werden kopiert\x2026",
     L"Elemente werden verschoben\x2026",
     L"Wird endgültig gelöscht\x2026",
-    L"%d%%   \x2022   %s   \x2022   %s/s Durchschnitt   \x2022   %llu %s",
+    L"%d%%   \x2022   %s   \x2022   %s/s Durchschnitt   \x2022   %llu %s   \x2022   %s",
     L"Fertig",
     L"Fertig \x2014 %llu %s übersprungen",
     L"Mit Fehlern beendet",
@@ -191,7 +198,14 @@ const wchar_t* kDe[] = {
     L"Fertig \x2014 %s in %s",
     // delete rate
     L"%llu Elem./s",
-    L"%d%%   \x2022   %llu %s   \x2022   %llu Elem./s Durchschnitt",
+    L"%d%%   \x2022   %llu %s   \x2022   %llu Elem./s Durchschnitt   \x2022   %s",
+    // keep-open checkbox
+    L"Fenster nach Abschluss geöffnet lassen",
+    // mirror completion summary
+    L"%d%%   \x2022   %s   \x2022   %s/s Durchschnitt   \x2022   %llu %s   \x2022   %llu gelöscht   \x2022   %s",
+    // volume queue
+    L"Wartet auf anderen AngelCOPY-Vorgang auf demselben Laufwerk\x2026",
+    L"Trotzdem starten (parallel)",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");

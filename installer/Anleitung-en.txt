@@ -1,0 +1,37 @@
+﻿ANGELCOPY — QUICK GUIDE
+=======================
+
+COPY & PASTE
+  1. Copy (Ctrl+C) or cut (Ctrl+X) files/folders as usual.
+  2. Paste in the destination folder:
+     • Ctrl+V — AngelCOPY takes over automatically, or
+     • right-click → "Paste FAST (AngelCOPY)".
+  Cut + paste = fast move.
+
+DRAG & DROP
+  Drag files/folders with the RIGHT mouse button onto the target:
+  "Copy here FAST" / "Move here FAST" / "Mirror here FAST".
+  (Left-drag stays with Windows — there is no supported hook for it.)
+
+MIRROR
+  The destination becomes an exact copy of the source: new and changed files
+  are copied, anything extra at the destination is DELETED. A dialog shows
+  exactly what will be copied and deleted first — Cancel is the default.
+
+DELETE
+  Selection → right-click "Delete FAST" or Shift+Del.
+  Permanent, NO Recycle Bin — it always asks first.
+
+THE PROGRESS DIALOG
+  • Green stretches in the bar = skipped (already up to date at the target).
+  • Speed and time remaining count only data actually copied.
+  • "Keep window open when done": the dialog stays with statistics including
+    the total duration. The choice is remembered globally.
+  • On conflicts AngelCOPY asks: Replace / Only if newer / Skip existing.
+
+WINDOWS 11
+  The entries live under "Show more options" (Shift+F10) — unless the
+  classic menu option was enabled during installation.
+
+This guide any time: Start menu → AngelCOPY → "AngelCOPY Guide"
+(or type "AngelCOPY Guide" into Windows search)

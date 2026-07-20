@@ -31,6 +31,7 @@ cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
    AngelCopyRunner\NativeCopy.cpp ^
    AngelCopyRunner\ProgressUI.cpp AngelCopyRunner\ConflictUI.cpp ^
    AngelCopyRunner\ConfirmUI.cpp AngelCopyRunner\Delete.cpp ^
+   AngelCopyRunner\VolumeLock.cpp ^
    shared\Localize.cpp shared\Theme.cpp ^
    /Fe:dist\AngelCopyRunner.exe ^
    /link /MANIFEST:EMBED Shlwapi.lib Comctl32.lib Gdi32.lib User32.lib Advapi32.lib Ole32.lib

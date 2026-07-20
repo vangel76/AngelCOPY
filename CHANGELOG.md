@@ -4,6 +4,143 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-20
+
+### Added
+- **Transfers on the same drive are serialized (volume queue).** Two AngelCOPY
+  copies onto the same slow disk don't go twice as fast — they fight over the
+  same write ceiling and each shows a wrong ETA. A job now waits for any
+  running job that shares a source or destination volume with it; the progress
+  dialog shows "Waiting for another AngelCOPY transfer on the same drive…" with
+  a working Cancel. Unrelated drives still run in parallel.
+  - **"Start anyway (run in parallel)"** button in the waiting state forces this
+    one transfer to run concurrently anyway. One-shot, never remembered. (A
+    `ANGELCOPY_NO_QUEUE=1` env var disables queueing globally, e.g. for scripts;
+    `--console` runs are never queued.)
+  - One named mutex per drive letter, held for the whole transfer (both phases
+    of a mirror). A mutex, not a lock file, so a crashed or killed runner
+    releases it automatically (`WAIT_ABANDONED`) instead of wedging the queue.
+    Deadlock-free by construction: volumes are always acquired in sorted order.
+    Verified with `tests\test_vlock.cpp` plus a two-process abandoned-recovery
+    test.
+
+## [1.1.0] — 2026-07-20
+
+Mirror ("Spiegeln"), a keep-open option with full completion statistics, a
+quick guide, and two rounds of security hardening — including two bugs that
+could lose data (a mirror purging files that still existed in the source, and
+long paths being silently skipped). Also: the Ctrl+V agent no longer runs
+elevated.
+
+### Security / hardening (second pass — installer, privileges, audit of the audit)
+- **The installer left the agent running elevated.** `[Run]` entries inherit
+  Setup's admin token, so `AngelCopyAgent.exe` ran at HIGH integrity for the
+  whole session (measured on a live machine: agent HIGH, Explorer MEDIUM).
+  Every copy/delete it launched via Ctrl+V / Shift+Del inherited admin rights
+  and bypassed file ACLs, and UIPI blocked the runner's "done" balloon to the
+  now-higher-integrity agent window (verified: `WM_COPYDATA` MEDIUM→HIGH fails
+  with ACCESS_DENIED). Both `[Run]` entries now use `runasoriginaluser`.
+- **Mirror traversed SOURCE-side junctions.** `FindExtras` only checked whether
+  the *destination* entry was a reparse point. Since the copy phase skips
+  source junctions entirely, descending into one compared the destination
+  against the link target's contents and purged everything the target lacked —
+  destination data loss. Now both sides are checked. Regression test added and
+  validated to fail without the fix.
+- **Long-path gaps left by the first pass.** `IsDirectory` (a >MAX_PATH source
+  folder read as a file and was planned as a loose-file job that copied
+  nothing), `Exists` (`UniqueCopyName` overwrote an existing "… - Kopie"), the
+  loose-file stat in the native engine (counted by the scan, dropped by the
+  engine), and the whole-tree rename probes. Regression test added covering
+  both a deep tree and a long source root; validated to fail without the fix.
+- **CF_HDROP reads now validate the medium and block size** in both the
+  IDataObject and the clipboard path — a crafted short block made
+  `DragQueryFileW` read past the allocation inside Explorer.
+- **Installer rejects a user-writable install directory** (checked by SID, not
+  by localized group name — `icacls` prints "VORDEFINIERT\Benutzer" on German).
+  Installing to such a path would let any standard user replace the DLL loaded
+  into every user's Explorer.
+- Smaller: the temp file-list is removed when the open fails (`GetTempFileNameW`
+  had already created it); the Ctrl+V/Shift+Del held-key flags are cleared
+  outside the enabled-gate, so toggling the agent off mid-press no longer
+  swallows the next keystroke silently.
+
+### Security / hardening (full audit, July 2026)
+- **Mirror could delete a destination file that still existed in the source
+  (long paths).** The scan/enumeration walkers (`ScanTree`, `FindExtras`,
+  `ClassifyFile`, native `WalkStream`) enumerated and stat'd WITHOUT the `\\?\`
+  prefix while the copy I/O used it. For a source path past `MAX_PATH` this made
+  an existing source read as "missing" → its destination twin was purged, and
+  made a plain copy silently omit those files while reporting success. Every
+  walker is now `\\?\`-prefixed like the deleter already was.
+- **Drive-root destinations corrupted the runner command line.** A copy/paste
+  into `D:\` produced `"D:\"`, whose `\"` is an escaped quote — the destination
+  swallowed the file-list argument and the transfer misfired. All arguments are
+  now quoted with a helper that doubles trailing backslashes (verified to
+  round-trip through `CommandLineToArgvW`).
+- **Recursion is depth-capped** in every tree walk (copy, scan, mirror-extras,
+  delete): a hand-crafted very deep tree can no longer overflow the stack and
+  crash mid-operation.
+- **Ctrl+V / Shift+Del auto-repeat no longer multi-launches.** Holding the keys
+  down spawned a copy process / delete dialog per repeat; the hook now fires
+  once per physical press.
+- **Ctrl+V fails safe when focus can't be determined** (`GetGUIThreadInfo`
+  failure now passes the key through to native text paste instead of swallowing
+  it).
+- Smaller fixes: registry read no longer over-reads a non-NUL-terminated value;
+  clipboard `DropEffect` reads check the block is ≥4 bytes; `GetModuleFileName`
+  truncation is treated as failure; the temp file-list is deleted if the runner
+  fails to launch and rejected if a short write truncated it; `IsRemotePath`'s
+  per-drive cache is atomic; the progress dialog runs the worker inline if the
+  engine thread can't spawn (instead of reporting a phantom success);
+  `CoUninitialize` is balanced only when init succeeded; the agent's
+  single-instance handle is closed on the early-exit path.
+
+### Added
+- **"Keep window open when done" checkbox** in the progress dialog (copy, move,
+  mirror, delete — it is one dialog). Default off; when checked, a clean run
+  ends with "Done" and a Close button instead of auto-closing after 700 ms, so
+  the final numbers are readable. The choice is global and persists across
+  transfers (`HKCU\Software\AngelCOPY`, saved on every toggle, not on close).
+  Error/skip/cancel cases keep their existing stay-open behavior regardless.
+- **Total duration in the completion summary** — the summary line now always
+  ends with the transfer's wall-clock time (e.g. "… • 300 files • 4:12"),
+  in both the bytes and the items/sec (delete) variants.
+- **Quick guide (DE/EN).** Shown as the installer's finish page (language
+  follows the setup language) and installed with a Start-menu shortcut
+  (Startmenü → AngelCOPY → Anleitung/Guide). Covers copy/paste, right-drag,
+  mirror, delete, the progress dialog and the Win11 "Show more options" note.
+  Deliberately NOT in the dialogs themselves: the progress dialog is transient,
+  and the confirm dialogs must be read, not clicked away toward a help file.
+- **Mirror gets its own completion summary**: copied volume with the copy-phase
+  average (purge seconds excluded from the rate — they move no bytes), file
+  count, number of items deleted at the destination, and the total wall-clock
+  time ("100% • 19 MB • 310 MB/s average • 300 files • 51 deleted • 0:08").
+- **The final statistics are no longer lost when a report opens.** The
+  skip/error report's header line used to overwrite the summary; it now goes
+  into the (empty at completion) ETA line, so volume/average/duration stay
+  visible above the report box.
+- **A cancelled transfer keeps its honest percentage.** Completion used to
+  force the band and the summary to 100% — on a cancel the statistics claimed
+  a finished transfer. Cancelled runs now show the percentage actually
+  reached; only genuinely complete runs snap to 100%.
+
+### Fixed
+- **Big files with a remote (SMB) end no longer use the unbuffered ring.**
+  Measured against \\mp-fileserver with a 2 GiB file: share→share the ring
+  dragged every byte over the wire twice (6–7 s) where `CopyFileExW` triggers
+  SMB server-side copy offload (~0.2 s, ~30x); share→local its unbuffered
+  reads bypassed the redirector's read-ahead (4.9–5.1 s vs 2.0–2.7 s buffered,
+  ~2x slower than robocopy). The ring now runs only when source AND destination
+  are local (`IsRemotePath`: UNC or `DRIVE_REMOTE`, cached per drive letter);
+  any remote end goes through `CopyFileExW`. Verified after the fix: download
+  1.9–2.0 s, share→share 227–231 ms. Local→share loses the ring's former ~6%
+  edge — accepted, a third code path isn't worth it.
+- SMB context from the same session (documented in CLAUDE.md): small-file
+  transfers and deletes on a share are latency-bound — all engines land at
+  31–38 MB/s for 10k×64 KiB; the parallel deleter's 8 threads buy 3.5x there
+  (16 would add ~15% more but is not worth a per-path thread count); same-share
+  moves are a ~5 ms rename where robocopy copies+deletes for seconds.
+
 ## [1.0.0] — 2026-07-18
 
 First real release. The headline change since the early internal build (0.1.0)

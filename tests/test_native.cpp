@@ -77,6 +77,12 @@ static void RmTree(const std::wstring& dir) {
     _wsystem(cmd.c_str());
 }
 
+// Local \\?\ helper for the long-path test (the engine's own is internal).
+static std::wstring Ext(const std::wstring& p) {
+    if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) return p;
+    return L"\\\\?\\" + p;
+}
+
 // Counting sink shared by the tests; errors print so failures are diagnosable.
 struct Counts {
     std::atomic<unsigned long long> bytes{0}, files{0}, skips{0}, skipBytes{0},
@@ -460,6 +466,71 @@ static void TestSameFolderCopy() {
     RmTree(base);
 }
 
+// Regression: paths past MAX_PATH must be scanned AND copied. The walkers once
+// enumerated/stat'd without the \\?\ prefix while the I/O used it, so long
+// paths were silently dropped — a copy reported complete but short, and in a
+// mirror an existing source read as "missing" and its destination twin was
+// purged. Covers both the whole-tree walk and the loose-file plan/engine pair.
+static void TestLongPaths() {
+    printf("Long paths (>MAX_PATH):\n");
+    std::wstring base = g_root + L"\\longp";
+    RmTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+
+    // Build a source tree whose leaf path exceeds MAX_PATH. Each level needs
+    // the \\?\ form to be created at all.
+    std::wstring seg(60, L'x');
+    std::wstring deep = base + L"\\src";
+    CreateDirectoryW(Ext(deep).c_str(), nullptr);
+    for (int i = 0; i < 5; ++i) {          // 5 * 61 chars past the base
+        deep += L"\\" + seg;
+        CreateDirectoryW(Ext(deep).c_str(), nullptr);
+    }
+    check(deep.size() > MAX_PATH, "  (setup) source path exceeds MAX_PATH");
+    WriteFileText(Ext(deep + L"\\deep.txt"), "DEEPDATA", 0);
+    check(Exists(Ext(deep + L"\\deep.txt")), "  (setup) deep file created");
+
+    // Whole-tree copy: the scan must count it and the engine must copy it.
+    std::vector<std::wstring> sources{base + L"\\src"};
+    auto jobs = PlanJobs(Operation::Copy, base + L"\\dst", sources, L"Copy");
+    check(!jobs.empty() && jobs[0].files.empty(),
+          "  deep source planned as a whole-tree job (IsDirectory saw it)");
+
+    ScanResult scan = ScanJobs(jobs, nullptr);
+    check(scan.lonelyFiles == 1, "  scan counted the deep file");
+
+    Counts c;
+    RunNativeJobs(Operation::Copy, jobs, Conflict::Replace, c.Sink());
+    // PlanJobs maps <src> onto <destDir>\<basename(src)>, so the tree lands
+    // under dst\src, not directly under dst.
+    std::wstring dstDeep = base + L"\\dst\\src";
+    for (int i = 0; i < 5; ++i) dstDeep += L"\\" + seg;
+    check(ReadText(Ext(dstDeep + L"\\deep.txt")) == "DEEPDATA",
+          "  deep file actually copied");
+    check(c.files.load() == 1, "  engine reported the deep file (no silent drop)");
+    check(c.errors.load() == 0, "  no errors");
+
+    // Second case: the SOURCE ROOT ITSELF is past MAX_PATH (user selects the
+    // deep folder directly). This is what exercises PlanJobs' IsDirectory —
+    // with a bare GetFileAttributesW it reads as "not a directory", the folder
+    // is planned as a LOOSE FILE, and nothing is copied. The first case above
+    // cannot catch that: its source root is short.
+    {
+        std::vector<std::wstring> deepSrc{deep};              // > MAX_PATH
+        auto j = PlanJobs(Operation::Copy, base + L"\\dst2", deepSrc, L"Copy");
+        check(j.size() == 1 && j[0].files.empty(),
+              "  long source ROOT planned as a whole-tree job, not a loose file");
+
+        Counts c2;
+        RunNativeJobs(Operation::Copy, j, Conflict::Replace, c2.Sink());
+        check(Exists(Ext(base + L"\\dst2\\" + seg + L"\\deep.txt")),
+              "  long source ROOT actually copied");
+        check(c2.errors.load() == 0, "  no errors (long source root)");
+    }
+
+    RmTree(base);
+}
+
 int wmain() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -478,6 +549,7 @@ int wmain() {
     TestReadonlyDest();
     TestCancel();
     TestSameFolderCopy();
+    TestLongPaths();
 
     RmTree(g_root);
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

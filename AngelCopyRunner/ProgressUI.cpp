@@ -1,5 +1,6 @@
 #include "ProgressUI.h"
 #include "Delete.h"
+#include "VolumeLock.h"
 #include "NativeCopy.h"
 #include "../shared/Localize.h"
 #include "../shared/Theme.h"
@@ -116,7 +117,17 @@ struct Shared {
     // deleted. The UI switches its heading; byte progress stays on the copy
     // volume (deletion is metadata work, not transfer).
     bool    phaseDelete = false;
+    // Snapshot at the copy→purge flip, so the final mirror summary can report
+    // the copy average (purge seconds excluded) and the purged item count
+    // (doneFiles past this baseline).
+    ULONGLONG          purgeStartTick = 0;
+    unsigned long long purgeBaseFiles = 0;
     LONG    cancel = 0;               // set by Cancel button
+    // Volume-queue wait state. `waiting` = blocked on another transfer sharing
+    // a volume (the UI shows a waiting heading + a "start anyway" button).
+    // `forceStart` = the user pressed that button: run in parallel this once.
+    bool    waiting = false;
+    LONG    forceStart = 0;
     bool    finished = false;
     int     exitCode = 0;
 
@@ -455,12 +466,50 @@ std::wstring FormatEta(double sec) {
     return out;
 }
 
+// ---- keep-open setting ----------------------------------------------------
+// "Keep window open when done" checkbox, persisted globally so it survives
+// across transfers. Saved on every toggle (not on close): a crash or a kill
+// must not lose the choice.
+
+constexpr int ID_KEEPOPEN = 2001;
+constexpr int ID_FORCESTART = 2002; // "start anyway" while queued
+constexpr wchar_t kSettingsKey[] = L"Software\\AngelCOPY";
+constexpr wchar_t kKeepOpenValue[] = L"KeepOpenAfterDone";
+
+bool LoadKeepOpen() {
+    HKEY h;
+    DWORD v = 0, cb = sizeof(v), type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_READ, &h) ==
+        ERROR_SUCCESS) {
+        if (RegQueryValueExW(h, kKeepOpenValue, nullptr, &type,
+                             reinterpret_cast<BYTE*>(&v), &cb) != ERROR_SUCCESS ||
+            type != REG_DWORD)
+            v = 0;
+        RegCloseKey(h);
+    }
+    return v != 0;
+}
+
+void SaveKeepOpen(bool on) {
+    HKEY h;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &h, nullptr) == ERROR_SUCCESS) {
+        DWORD v = on ? 1 : 0;
+        RegSetValueExW(h, kKeepOpenValue, 0, REG_DWORD,
+                       reinterpret_cast<const BYTE*>(&v), sizeof(v));
+        RegCloseKey(h);
+    }
+}
+
 // ---- window --------------------------------------------------------------
 
 struct UiState {
     Shared* sh;
     HWND hwnd;   // top-level window, for the taskbar progress button
     HWND chart, lblTitle, lblName, lblEta, lblRemaining, btnCancel, edErrors;
+    HWND chkKeep;   // "keep window open when done", persisted in HKCU
+    HWND btnForce;  // "start anyway", shown only while queued behind another job
+    bool forceShown = false;
     HFONT font, fontBold;
     ITaskbarList3* taskbar = nullptr; // colored taskbar-button progress; may be null
     bool deleteMode = false;          // rate/label in items/sec, not bytes/sec
@@ -700,6 +749,34 @@ LRESULT CALLBACK ChartProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 void UpdateUi(UiState* ui) {
     Shared* sh = ui->sh;
+
+    // Queued behind another transfer on a shared volume: no bytes are moving,
+    // show a waiting heading and offer "start anyway". Keep the "start anyway"
+    // button in sync with the wait state; Cancel keeps working throughout.
+    EnterCriticalSection(&sh->cs);
+    bool waiting = sh->waiting;
+    LeaveCriticalSection(&sh->cs);
+    if (waiting && !ui->done) {
+        if (!ui->forceShown) {
+            SetWindowTextW(ui->lblTitle, loc::T(loc::S::HeadWaiting));
+            SetWindowTextW(ui->lblName, L"");
+            SetWindowTextW(ui->lblEta, L"");
+            SetWindowTextW(ui->lblRemaining, L"");
+            // The keep-open checkbox occupies the same row on the left; it is
+            // about after-completion, meaningless while queued. Hide it and put
+            // the force button in its place so the two never overlap.
+            ShowWindow(ui->chkKeep, SW_HIDE);
+            ShowWindow(ui->btnForce, SW_SHOW);
+            ui->forceShown = true;
+        }
+        return; // nothing else to draw until the transfer actually starts
+    }
+    if (ui->forceShown) {
+        ShowWindow(ui->btnForce, SW_HIDE);
+        ShowWindow(ui->chkKeep, SW_SHOW);
+        ui->forceShown = false;
+    }
+
     unsigned long long realDone = DoneBytes(*sh); // takes the lock itself
     EnterCriticalSection(&sh->cs);
     unsigned long long total = sh->totalBytes;
@@ -708,6 +785,8 @@ void UpdateUi(UiState* ui) {
     unsigned long long dFiles = sh->doneFiles, tFiles = sh->totalFiles;
     std::wstring cur = sh->currentFile;
     bool phaseDel = sh->phaseDelete;
+    ULONGLONG purgeTick = sh->purgeStartTick;
+    unsigned long long purgeBase = sh->purgeBaseFiles;
     LeaveCriticalSection(&sh->cs);
 
     // Copied and skipped bytes are kept apart the whole way down: both advance
@@ -769,9 +848,12 @@ void UpdateUi(UiState* ui) {
 
     // total == 0 means nothing had to be copied (all skipped) — that is
     // complete, not 0%. Likewise the band must read full once finished, even if
-    // the IO counters land a hair under the scanned total.
+    // the IO counters land a hair under the scanned total. A CANCELLED run is
+    // the exception: forcing 100% there made the final statistics claim a
+    // complete transfer that never happened — it keeps its honest percentage.
+    bool wasCancelled = InterlockedCompareExchange(&sh->cancel, 0, 0) != 0;
     int pct = total ? (int)((done * 100) / total) : 100;
-    if (ui->done) pct = 100;
+    if (ui->done && !wasCancelled) pct = 100;
     ui->pct = pct;
     ui->rateNow = rate;
 
@@ -807,16 +889,38 @@ void UpdateUi(UiState* ui) {
     InvalidateRect(ui->chart, nullptr, FALSE);
 
     if (ui->done) {
+        // Total duration always closes the summary — measured wall clock of
+        // the whole transfer, including scan/enumeration and (mirror) purge.
+        std::wstring dur = FormatEta(elapsed);
         wchar_t stats[256];
-        if (itemsRate)
+        if (phaseDel && !ui->deleteMode) {
+            // Mirror: one line covering both phases — copied volume with the
+            // COPY average (purge seconds excluded from the rate, they moved
+            // no bytes), purged item count, total wall clock.
+            unsigned long long copyFiles =
+                (purgeBase && purgeBase <= tFiles) ? purgeBase : dFiles;
+            unsigned long long deleted =
+                (dFiles > purgeBase) ? dFiles - purgeBase : 0;
+            double copyElapsed = (purgeTick > ui->startTick)
+                                     ? (purgeTick - ui->startTick) / 1000.0
+                                     : elapsed;
+            double copyAvg =
+                (copyElapsed > 0.05) ? (double)realDone / copyElapsed : 0.0;
+            StringCchPrintfW(stats, 256, loc::T(loc::S::SyncStatsDone), pct,
+                             HumanBytes(total).c_str(),
+                             HumanBytes((unsigned long long)copyAvg).c_str(),
+                             copyFiles, loc::NounFile(copyFiles), deleted,
+                             dur.c_str());
+        } else if (itemsRate) {
             StringCchPrintfW(stats, 256, loc::T(loc::S::StatsDoneItems), pct,
                              tFiles, loc::NounFile(tFiles),
-                             (unsigned long long)rate);
-        else
+                             (unsigned long long)rate, dur.c_str());
+        } else {
             StringCchPrintfW(stats, 256, loc::T(loc::S::StatsDone), pct,
                              HumanBytes(total).c_str(),
                              HumanBytes((unsigned long long)rate).c_str(), tFiles,
-                             loc::NounFile(tFiles));
+                             loc::NounFile(tFiles), dur.c_str());
+        }
         SetWindowTextW(ui->lblName, stats);
         SetWindowTextW(ui->lblEta, L"");
         SetWindowTextW(ui->lblRemaining, L"");
@@ -900,7 +1004,10 @@ void ShowReport(HWND hwnd, UiState* ui, bool failed) {
 
     SetWindowTextW(ui->edErrors, text.c_str());
 
-    // Summary line above the list.
+    // Summary line above the list — into the (empty at completion) ETA line,
+    // NOT lblName: that one holds the final statistics (volume, average,
+    // duration), which used to be overwritten and lost whenever a report
+    // appeared.
     wchar_t hdr[200];
     if (nErr) {
         StringCchPrintfW(hdr, 200, loc::T(loc::S::HdrErrors),
@@ -910,7 +1017,7 @@ void ShowReport(HWND hwnd, UiState* ui, bool failed) {
         StringCchPrintfW(hdr, 200, loc::T(loc::S::HdrSkipped), n,
                          loc::NounFile(n));
     }
-    SetWindowTextW(ui->lblName, hdr);
+    SetWindowTextW(ui->lblEta, hdr);
 
     // Grow the client area, then place the box and move the Close button below
     // it (never overlapping).
@@ -920,6 +1027,9 @@ void ShowReport(HWND hwnd, UiState* ui, bool failed) {
     ShowWindow(ui->edErrors, SW_SHOW);
     SetWindowPos(ui->btnCancel, nullptr, UI_W - UI_MARGIN - UI_BTN_W,
                  UI_BTN_Y_REPORT, UI_BTN_W, UI_BTN_H, SWP_NOZORDER);
+    // The checkbox rides on the button row — keep them together.
+    SetWindowPos(ui->chkKeep, nullptr, UI_MARGIN, UI_BTN_Y_REPORT + 5, 0, 0,
+                 SWP_NOZORDER | SWP_NOSIZE);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -947,6 +1057,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_COMMAND:
+        if (ui && LOWORD(wp) == ID_KEEPOPEN && HIWORD(wp) == BN_CLICKED) {
+            // Persist immediately: the choice must survive however this
+            // process ends.
+            SaveKeepOpen(SendMessageW(ui->chkKeep, BM_GETCHECK, 0, 0) ==
+                         BST_CHECKED);
+            return 0;
+        }
+        if (ui && LOWORD(wp) == ID_FORCESTART) {
+            // Run in parallel this once: the worker's wait loop sees this and
+            // stops queueing. One-shot, never persisted.
+            InterlockedExchange(&ui->sh->forceStart, 1);
+            ShowWindow(ui->btnForce, SW_HIDE);
+            ShowWindow(ui->chkKeep, SW_SHOW); // restore what waiting hid
+            ui->forceShown = false;
+            return 0;
+        }
         if (ui && LOWORD(wp) == IDCANCEL) {
             if (ui->done) { DestroyWindow(hwnd); return 0; }
             // Request cancel: kill the running robocopy.
@@ -973,9 +1099,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetWindowTextW(ui->lblTitle, loc::T(loc::S::TitleCancelled));
                 SetWindowTextW(ui->btnCancel, loc::T(loc::S::BtnClose));
                 EnableWindow(ui->btnCancel, TRUE);
-                if (hasErrors) ShowReport(hwnd, ui, false);
                 SetWindowTextW(ui->lblEta, L"");
                 SetWindowTextW(ui->lblRemaining, L"");
+                if (hasErrors) ShowReport(hwnd, ui, false); // writes lblEta
             } else if (code >= 8 || hasErrors) {
                 // code 8 = some files failed but copy continued; still surface it.
                 if (ui->taskbar)
@@ -997,6 +1123,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetWindowTextW(ui->btnCancel, loc::T(loc::S::BtnClose));
                 EnableWindow(ui->btnCancel, TRUE);
                 ShowReport(hwnd, ui, false);
+            } else if (SendMessageW(ui->chkKeep, BM_GETCHECK, 0, 0) ==
+                       BST_CHECKED) {
+                // Clean run, but the user wants to read the numbers: behave
+                // like the skip case minus the report — stay open with Close.
+                SetWindowTextW(ui->lblTitle, loc::T(loc::S::TitleDone));
+                SetWindowTextW(ui->btnCancel, loc::T(loc::S::BtnClose));
+                EnableWindow(ui->btnCancel, TRUE);
+                KillTimer(hwnd, 1);
             } else {
                 // Nothing skipped, nothing failed: brief pause then auto-close.
                 SetWindowTextW(ui->lblTitle, loc::T(loc::S::TitleDone));
@@ -1042,7 +1176,7 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
           Conflict policy, SkipInfo skipped,
           const std::unordered_set<std::wstring>* skipSet,
           std::vector<std::wstring> dstPrefixes, Worker worker,
-          bool deleteMode = false) {
+          bool deleteMode = false, std::vector<wchar_t> volumes = {}) {
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -1095,7 +1229,9 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
 
     // Colored taskbar-button progress (optional; ignored if it can't be had).
     // COM was not otherwise needed in the runner UI thread — init it here.
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // Only balance CoUninitialize when the init actually succeeded (skip on
+    // RPC_E_CHANGED_MODE etc.).
+    const bool comInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
     if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_ALL,
                                    IID_PPV_ARGS(&ui.taskbar)))) {
         if (FAILED(ui.taskbar->HrInit())) {
@@ -1132,6 +1268,22 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
         WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false),
         UI_W - UI_MARGIN - UI_BTN_W, UI_BTN_Y, UI_BTN_W, UI_BTN_H, hwnd,
         (HMENU)IDCANCEL, hInst, nullptr);
+    // Keep-open checkbox, left of the Cancel/Close button. State is global
+    // (HKCU) and saved on every toggle.
+    ui.chkKeep = CreateWindowW(L"BUTTON", loc::T(loc::S::ChkKeepOpen),
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        UI_MARGIN, UI_BTN_Y + (UI_BTN_H - 20) / 2,
+        UI_W - 3 * UI_MARGIN - UI_BTN_W, 20, hwnd,
+        (HMENU)(INT_PTR)ID_KEEPOPEN, hInst, nullptr);
+    SendMessageW(ui.chkKeep, BM_SETCHECK,
+                 LoadKeepOpen() ? BST_CHECKED : BST_UNCHECKED, 0);
+    // "Start anyway" — hidden; shown only while queued behind another transfer
+    // (see UpdateUi's waiting branch). Wider than the standard button: the
+    // label is longer.
+    ui.btnForce = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnStartAnyway),
+        WS_CHILD | theme::ButtonStyle(false),
+        UI_MARGIN, UI_BTN_Y, 200, UI_BTN_H, hwnd,
+        (HMENU)(INT_PTR)ID_FORCESTART, hInst, nullptr);
     // Report box — hidden until there is something to report, then revealed and
     // the window grows to show it (see ShowReport).
     ui.edErrors = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1144,6 +1296,8 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
     SetChildFont(ui.lblEta, ui.font);
     SetChildFont(ui.lblRemaining, ui.font);
     SetChildFont(ui.btnCancel, ui.font);
+    SetChildFont(ui.chkKeep, ui.font);
+    SetChildFont(ui.btnForce, ui.font);
     SetChildFont(ui.edErrors, ui.font);
 
     ui.startTick = GetTickCount64();
@@ -1153,10 +1307,43 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
 
     theme::ApplyToWindow(hwnd);
     theme::ApplyToControl(ui.btnCancel);
+    theme::ApplyToControl(ui.chkKeep);
     theme::ApplyToControl(ui.edErrors);
 
-    EngineArgs ea{&sh, hwnd, std::move(worker)};
+    // Wrap the worker so it first waits for any transfer sharing a volume with
+    // this one (unless ANGELCOPY_NO_QUEUE forces parallel). The wait runs on
+    // the engine thread so Cancel and "start anyway" stay responsive, and the
+    // lock is held for the whole transfer (released when the wrapper returns).
+    Worker inner = std::move(worker);
+    Worker gated = [inner, volumes](Shared& s) -> int {
+        VolumeLock lock;
+        bool noQueue = GetEnvironmentVariableW(L"ANGELCOPY_NO_QUEUE", nullptr, 0) != 0;
+        if (!noQueue && !volumes.empty()) {
+            bool ok = lock.Acquire(
+                volumes,
+                [&s] { return InterlockedCompareExchange(&s.cancel, 0, 0) != 0; },
+                [&s] { return InterlockedCompareExchange(&s.forceStart, 0, 0) != 0; },
+                [&s] {
+                    EnterCriticalSection(&s.cs);
+                    s.waiting = true;
+                    LeaveCriticalSection(&s.cs);
+                });
+            EnterCriticalSection(&s.cs);
+            s.waiting = false;
+            LeaveCriticalSection(&s.cs);
+            if (!ok) return -1; // cancelled while queued: nothing touched
+        }
+        return inner(s);
+    };
+
+    EngineArgs ea{&sh, hwnd, std::move(gated)};
     HANDLE th = CreateThread(nullptr, 0, EngineThread, &ea, 0, nullptr);
+    if (!th) {
+        // Thread spawn failed — run the worker inline so the transfer still
+        // happens (and its result is reported) instead of showing an idle
+        // dialog that returns success having copied nothing.
+        EngineThread(&ea);
+    }
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
@@ -1192,7 +1379,7 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
         ui.taskbar->SetProgressState(hwnd, TBPF_NOPROGRESS);
         ui.taskbar->Release();
     }
-    CoUninitialize();
+    if (comInit) CoUninitialize();
     if (ui.fontBold && ui.fontBold != ui.font) DeleteObject(ui.fontBold);
     if (ui.font && ui.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(ui.font);
     return code;
@@ -1362,6 +1549,16 @@ bool RunScanWithUI(ScanProgress& prog, const std::function<void()>& work) {
     return prog.cancel.load() == 0;
 }
 
+// Every source + destination directory across the jobs, for the volume queue.
+static std::vector<std::wstring> AllJobPaths(const std::vector<RoboJob>& jobs) {
+    std::vector<std::wstring> paths;
+    for (const RoboJob& job : jobs) {
+        paths.push_back(job.srcDir);
+        paths.push_back(job.dstDir);
+    }
+    return paths;
+}
+
 int RunJobsWithUI(Operation op, const std::wstring& destLabel,
                   const std::vector<RoboJob>& jobs,
                   unsigned long long expectedBytes,
@@ -1384,7 +1581,8 @@ int RunJobsWithUI(Operation op, const std::wstring& destLabel,
                  std::move(dstPrefixes),
                  [op, &jobs, policy](Shared& sh) {
                      return RunCopyJobs(sh, op, jobs, policy);
-                 });
+                 },
+                 /*deleteMode=*/false, VolumesForPaths(AllJobPaths(jobs)));
 }
 
 int RunDeleteWithUI(const std::vector<std::wstring>& targets,
@@ -1394,7 +1592,7 @@ int RunDeleteWithUI(const std::vector<std::wstring>& targets,
                  expectedBytes, expectedFiles, Conflict::Replace, SkipInfo{},
                  nullptr, {},
                  [&targets](Shared& sh) { return RunDelete(sh, targets); },
-                 /*deleteMode=*/true);
+                 /*deleteMode=*/true, VolumesForPaths(targets));
 }
 
 int RunSyncWithUI(const std::vector<RoboJob>& jobs,
@@ -1421,10 +1619,13 @@ int RunSyncWithUI(const std::vector<RoboJob>& jobs,
                      if (rc >= 8) return rc; // copy failed: do NOT purge
                      EnterCriticalSection(&sh.cs);
                      sh.phaseDelete = true;
+                     sh.purgeStartTick = GetTickCount64();
+                     sh.purgeBaseFiles = sh.doneFiles;
                      LeaveCriticalSection(&sh.cs);
                      int rd = RunDelete(sh, extraTargets);
                      return rd > rc ? rd : rc;
-                 });
+                 },
+                 /*deleteMode=*/false, VolumesForPaths(AllJobPaths(jobs)));
 }
 
 } // namespace angelcopy

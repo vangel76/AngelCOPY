@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cwctype>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -17,6 +18,9 @@ namespace {
 constexpr unsigned long long kBigFileBytes = 32ull << 20; // ring threshold
 constexpr DWORD  kRingChunk = 8u << 20;                   // 8 MiB
 constexpr int    kRingDepth = 8;                          // QD8
+// Recursion cap: a pathologically deep source tree (\\?\ allows thousands of
+// levels) must not overflow the ~1 MB stack. Matches Robocopy/Delete.
+constexpr int    kMaxWalkDepth = 900;
 constexpr size_t kChunkFiles = 256;  // dir-shard split so flat dirs parallelize
 constexpr int    kRetries = 2;       // matches the old /R:2
 constexpr DWORD  kRetryWaitMs = 2000; // matches the old /W:2
@@ -165,8 +169,13 @@ struct ChunkQueue {
 // copying starts as soon as the first directory is read.
 void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
                 Conflict policy, const CopySink& sink, ChunkQueue& queue,
-                std::vector<Item>& bigs, std::vector<std::wstring>& dirsPost) {
+                std::vector<Item>& bigs, std::vector<std::wstring>& dirsPost,
+                int depth = 0) {
     if (Cancelled(sink)) return;
+    if (depth >= kMaxWalkDepth) {
+        ReportError(sink, srcDir, ERROR_STACK_OVERFLOW);
+        return;
+    }
     if (!CreateDirectoryExW(ExtPath(srcDir).c_str(), ExtPath(dstDir).c_str(),
                             nullptr) &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
@@ -184,8 +193,11 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
     };
 
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW((srcDir + L"\\*").c_str(), FindExInfoBasic, &fd,
-                                FindExSearchNameMatch, nullptr, 0);
+    // \\?\-prefixed: the copy I/O uses ExtPath, so the walk must too, or a
+    // source subtree past MAX_PATH is silently skipped and a short copy is
+    // reported as complete. Matches ScanTree in Robocopy.cpp exactly.
+    HANDLE h = FindFirstFileExW(ExtPath(srcDir + L"\\*").c_str(), FindExInfoBasic,
+                                &fd, FindExSearchNameMatch, nullptr, 0);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (Cancelled(sink)) break;
@@ -198,7 +210,8 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
 
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 flush(); // keep chunks single-directory
-                WalkStream(src, dst, policy, sink, queue, bigs, dirsPost);
+                WalkStream(src, dst, policy, sink, queue, bigs, dirsPost,
+                           depth + 1);
             } else {
                 unsigned long long size =
                     ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
@@ -427,9 +440,38 @@ DWORD RingCopyFile(const Item& it, const CopySink& sink) {
     return 0;
 }
 
+// The ring is a LOCAL-disk tool. Measured on \\mp-fileserver (July 2026,
+// 2 GiB): share→share via CopyFileExW ~0.2 s — SMB server-side copy offload,
+// the data never crosses the wire — vs the ring's 6–7 s (every byte over the
+// wire twice, ~30x slower). share→local: unbuffered ring reads bypass the
+// redirector's read-ahead, 4.9–5.1 s vs 2.0–2.7 s buffered (~2x slower).
+// local→share the ring won by ~6% — not worth a third code path. Rule: the
+// ring runs only when BOTH ends are local; any remote end goes to CopyFileEx.
+bool IsRemotePath(const std::wstring& p) {
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return true; // UNC
+    if (p.size() >= 2 && p[1] == L':') {
+        wchar_t letter = (wchar_t)towupper(p[0]);
+        if (letter < L'A' || letter > L'Z') return false;
+        // Per-letter cache queried from every copy-pool thread; atomic (relaxed)
+        // because the writes are idempotent but a plain int would be a data race.
+        static std::atomic<int> cache[26]; // 0 unknown, 1 local, 2 remote
+        std::atomic<int>& slot = cache[letter - L'A'];
+        int v = slot.load(std::memory_order_relaxed);
+        if (v == 0) {
+            wchar_t root[4] = {letter, L':', L'\\', 0};
+            v = (GetDriveTypeW(root) == DRIVE_REMOTE) ? 2 : 1;
+            slot.store(v, std::memory_order_relaxed);
+        }
+        return v == 2;
+    }
+    return false;
+}
+
 // Big file with ring, falling back to CopyFileEx when the unbuffered open is
 // refused (some filters/shares dislike FILE_FLAG_NO_BUFFERING).
 bool CopyOneBig(const Item& it, const CopySink& sink) {
+    if (IsRemotePath(it.src) || IsRemotePath(it.dst))
+        return CopyOneFile(it, sink); // see IsRemotePath: measured, not a guess
     DWORD e = RingCopyFile(it, sink);
     if (e == 0) return true;
     if (e == ERROR_REQUEST_ABORTED) return false;
@@ -474,17 +516,19 @@ bool MoveOneFile(const Item& it, const CopySink& sink) {
 // entire tree moves in one metadata operation. Afterwards the moved tree is
 // walked (cheap) so the progress totals still add up.
 bool TryRenameTree(const RoboJob& job, const CopySink& sink) {
-    if (GetFileAttributesW(job.dstDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(ExtPath(job.dstDir).c_str()) != INVALID_FILE_ATTRIBUTES)
         return false;
     if (!MoveFileExW(ExtPath(job.srcDir).c_str(), ExtPath(job.dstDir).c_str(), 0))
         return false;
 
     struct Reporter {
         const CopySink& sink;
-        void Walk(const std::wstring& dir) {
+        void Walk(const std::wstring& dir, int depth = 0) {
+            if (depth >= kMaxWalkDepth) return; // totals only; safe to stop
             WIN32_FIND_DATAW fd;
-            HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic,
-                                        &fd, FindExSearchNameMatch, nullptr, 0);
+            HANDLE h = FindFirstFileExW(ExtPath(dir + L"\\*").c_str(),
+                                        FindExInfoBasic, &fd,
+                                        FindExSearchNameMatch, nullptr, 0);
             if (h == INVALID_HANDLE_VALUE) return;
             do {
                 if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
@@ -492,7 +536,7 @@ bool TryRenameTree(const RoboJob& job, const CopySink& sink) {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
                 std::wstring p = dir + L"\\" + fd.cFileName;
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    Walk(p);
+                    Walk(p, depth + 1);
                 } else {
                     unsigned long long size =
                         ((unsigned long long)fd.nFileSizeHigh << 32) |
@@ -662,7 +706,12 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                 std::wstring dst = job.dstDir + L"\\" +
                     (i < job.dstNames.size() ? job.dstNames[i] : f);
                 WIN32_FILE_ATTRIBUTE_DATA fa{};
-                if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa))
+                // ExtPath is required here: ScanJobs stats the same file via
+                // Ext(), so a bare query would make the engine drop a
+                // >MAX_PATH loose file the scan already counted — a silent
+                // short copy reported as complete.
+                if (!GetFileAttributesExW(ExtPath(src).c_str(),
+                                          GetFileExInfoStandard, &fa))
                     continue; // vanished since planning; scan skipped it too
                 unsigned long long size =
                     ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
@@ -681,7 +730,7 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
 
 bool TryQuickRenameMove(const RoboJob& job) {
     if (!job.files.empty()) return false; // whole-tree jobs only
-    if (GetFileAttributesW(job.dstDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(ExtPath(job.dstDir).c_str()) != INVALID_FILE_ATTRIBUTES)
         return false; // destination exists: conflicts possible, scan first
     CreateDirDeep(ParentOf(job.dstDir));
     return MoveFileExW(ExtPath(job.srcDir).c_str(), ExtPath(job.dstDir).c_str(),

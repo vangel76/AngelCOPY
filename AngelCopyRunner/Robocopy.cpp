@@ -35,8 +35,13 @@ std::wstring BaseName(const std::wstring& path) {
     return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
 }
 
+// Ext() below is declared after this point; forward-declare so the long-path
+// form is used here too. A >MAX_PATH source directory that read as "not a
+// directory" was planned as a loose-file job and then copied nothing.
+std::wstring Ext(const std::wstring& p);
+
 bool IsDirectory(const std::wstring& path) {
-    DWORD attr = GetFileAttributesW(path.c_str());
+    DWORD attr = GetFileAttributesW(Ext(path).c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -53,6 +58,19 @@ std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
     return d + L"\\" + name;
 }
 
+// \\?\ long-path form for the scan/enumeration side, so a source subtree past
+// MAX_PATH is walked and classified exactly like the native engine copies it.
+// Without this, FindFirstFile on a >MAX_PATH path fails and the scan silently
+// omits those files — a copy reported complete but short, and (worse) in a
+// mirror an existing source read as "missing" so its destination twin was
+// purged. Mirrors Delete.cpp's Ext()/NativeCopy.cpp's ExtPath().
+std::wstring Ext(const std::wstring& p) {
+    if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) return p;
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\')
+        return L"\\\\?\\UNC\\" + p.substr(2);
+    return L"\\\\?\\" + p;
+}
+
 std::wstring LowerCopy(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](wchar_t c) { return (wchar_t)std::towlower(c); });
@@ -64,7 +82,10 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
 }
 
 bool Exists(const std::wstring& p) {
-    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+    // Long-path form: UniqueCopyName uses this to find a free "<name> - Kopie";
+    // a bare query on a >MAX_PATH candidate reads as free and the copy then
+    // OVERWRITES the existing one.
+    return GetFileAttributesW(Ext(p).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 // Windows-style "<stem> - <copyWord><ext>", bumped to " (2)", " (3)" … until
@@ -241,7 +262,7 @@ FileClass ClassifyFile(const std::wstring& dst, unsigned long long srcSize,
                        const FILETIME& srcTime, unsigned long long& dstSize) {
     dstSize = 0;
     WIN32_FILE_ATTRIBUTE_DATA fa{};
-    if (!GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &fa))
+    if (!GetFileAttributesExW(Ext(dst).c_str(), GetFileExInfoStandard, &fa))
         return FileClass::Lonely;
 
     dstSize = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
@@ -286,11 +307,17 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
         acc.conflictSample.push_back(dst);
 }
 
+// Cap recursion so a pathologically deep tree can't overflow the stack. The
+// scan just stops descending at the cap; the copy walk (NativeCopy) caps
+// identically, so totals and copy stay consistent.
+constexpr int kMaxScanDepth = 900;
+
 void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
-              ScanResult& acc, ScanProgress* prog) {
+              ScanResult& acc, ScanProgress* prog, int depth = 0) {
+    if (depth >= kMaxScanDepth) return;
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW((srcDir + L"\\*").c_str(), FindExInfoBasic, &fd,
-                                FindExSearchNameMatch, nullptr, 0);
+    HANDLE h = FindFirstFileExW(Ext(srcDir + L"\\*").c_str(), FindExInfoBasic,
+                                &fd, FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
@@ -302,7 +329,7 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
         std::wstring dst = dstDir + L"\\" + fd.cFileName;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ScanTree(src, dst, acc, prog);
+            ScanTree(src, dst, acc, prog, depth + 1);
         } else {
             if (prog) prog->files.fetch_add(1, std::memory_order_relaxed);
             unsigned long long size =
@@ -332,7 +359,7 @@ ScanResult ScanJobs(const std::vector<RoboJob>& jobs, ScanProgress* prog) {
                 std::wstring dst = job.dstDir + L"\\" +
                     (i < job.dstNames.size() ? job.dstNames[i] : f);
                 WIN32_FILE_ATTRIBUTE_DATA fa{};
-                if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa))
+                if (!GetFileAttributesExW(Ext(src).c_str(), GetFileExInfoStandard, &fa))
                     continue;
                 unsigned long long size =
                     ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
@@ -378,10 +405,14 @@ namespace {
 // are real directories — a reparse point at the destination is either an
 // extra (deleted as a link) or left alone, never entered.
 void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
-                std::vector<std::wstring>& out, ScanProgress* prog) {
+                std::vector<std::wstring>& out, ScanProgress* prog,
+                int depth = 0) {
+    // At the depth cap, stop descending WITHOUT emitting extras: an unscanned
+    // level must never have its destination entries deleted as "missing".
+    if (depth >= kMaxScanDepth) return;
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW((dstDir + L"\\*").c_str(), FindExInfoBasic, &fd,
-                                FindExSearchNameMatch, nullptr, 0);
+    HANDLE h = FindFirstFileExW(Ext(dstDir + L"\\*").c_str(), FindExInfoBasic,
+                                &fd, FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
@@ -395,7 +426,10 @@ void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
         bool dstIsDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         bool dstIsLink = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
-        DWORD sa = GetFileAttributesW(src.c_str());
+        // MUST be \\?\-prefixed: a long src path reading as INVALID here would
+        // mark an existing source entry as "extra" and DELETE its destination
+        // twin during the purge — destination data loss in the safest op.
+        DWORD sa = GetFileAttributesW(Ext(src).c_str());
         if (sa == INVALID_FILE_ATTRIBUTES) {
             out.push_back(dst); // not in the source at all
             continue;
@@ -407,7 +441,13 @@ void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
             out.push_back(dst);
             continue;
         }
-        if (dstIsDir && !dstIsLink) FindExtras(src, dst, out, prog);
+        // A SOURCE-side reparse point must not be traversed either. The copy
+        // phase skips source junctions entirely (ScanTree/WalkStream `continue`
+        // on them), so descending here would compare the destination against
+        // the LINK TARGET's contents and purge everything that isn't in it —
+        // destination data loss driven by a link the copy never followed.
+        if (sa & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (dstIsDir && !dstIsLink) FindExtras(src, dst, out, prog, depth + 1);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }

@@ -43,6 +43,12 @@ build.bat                                             REM -> dist\*.dll, *.exe
   Junction safety for mirror is covered by running `--console sync` against a
   tree whose destination holds a junction to a PRECIOUS folder — the link goes,
   the target survives.
+- **Volume-queue unit tests:** `tests\test_vlock.cpp` (compile with
+  `VolumeLock.cpp`) — volume extraction, mutual exclusion on a shared volume,
+  cancel/force short-circuits. Abandoned-mutex recovery (a killed holder must
+  free the volume) needs two processes; verify with a helper that acquires
+  `Local\AngelCopyVol_X` and `TerminateProcess`es itself, then a second that
+  must still acquire.
 - **Do NOT auto-register on the dev machine** — it kills and restarts the live
   Explorer. Let the user run `AngelCOPY-Setup.exe` or `scripts\install-dev.bat`.
 
@@ -119,7 +125,12 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - `shared/Localize.*` — all user-visible strings, compiled into ALL binaries.
 - `installer/AngelCOPY.iss` — Inno Setup. DLL entry has `regserver` (Inno calls
   Dll(Un)RegisterServer) + `uninsrestartdelete`; restarts Explorer on
-  install/uninstall.
+  install/uninstall. Quick guide `installer/Anleitung-{de,en}.txt` (UTF-8 WITH
+  BOM — BOM-less .txt is read as ANSI by Inno and the umlauts mangle) doubles
+  as the post-install InfoAfter page and a Start-menu shortcut; per-language
+  via the [Languages] entries. No guide links inside the dialogs (decided July
+  2026): the progress dialog is transient and the confirm dialogs must be
+  read, not clicked away toward a help file.
 
 ## Native engine gotchas (all measured — re-run bench\bench.cpp before "fixing")
 
@@ -169,15 +180,61 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **The engine's walk must mirror `ScanTree` exactly** (reparse points skipped,
   same classification via the shared `ClassifyFile`), or the progress totals
   and the conflict prompt drift from what actually happens.
-- **No SMB measurements exist yet.** Thread count / QD on shares is unknown —
-  defaults stay the locally-measured ones, `ANGELCOPY_THREADS` exists so a
-  future share can be measured. Do NOT ship remote-path heuristics unmeasured.
+- **On a SATA SSD the big-file race is over before it starts.** Measured July
+  2026 on D: (Samsung 850 EVO 2TB, SATA, 95% full, same-disk copy): a 4 GiB
+  cold-cache copy lands at 234–272 MB/s for EVERY engine — robocopy 248–264,
+  our ring 266–272 (+3–7%). Same-disk copy splits the ~550 MB/s bus into
+  read+write; nothing an engine does can move that ceiling, and Explorer sits
+  at the same wall. The engine still wins where the bus isn't the limit: small
+  files +20–25% (dir-sharded 426–467 vs robocopy 326–387 MB/s; first robocopy
+  run after tree creation is a cold-metadata outlier, ignore it) and
+  same-volume moves (rename, ~0.3 ms vs robocopy's 8.7 s copy+delete on 2 GiB).
+  "Barely faster than Explorer on D:" for big files is expected physics, not a
+  regression — the +32% big-file win needs NVMe headroom.
+- **The big-file ring is LOCAL-only — any remote end routes to `CopyFileExW`.**
+  Measured July 2026 against \\mp-fileserver (2 GiB): share→share via
+  CopyFileExW ~0.2 s (SMB server-side copy offload — the bytes never cross the
+  wire) vs the ring's 6–7 s (every byte over the wire TWICE, ~30x); share→
+  local ring 4.9–5.1 s vs buffered 2.0–2.7 s (unbuffered reads bypass the
+  redirector's read-ahead, ~2x); local→share the ring won by only ~6%.
+  `IsRemotePath` (UNC prefix or `GetDriveType == DRIVE_REMOTE`, cached per
+  drive letter) gates `CopyOneBig`. This is a MEASURED remote rule — the ban
+  on unmeasured remote heuristics stands for everything else.
+- **SMB small files & delete are latency-bound, not engine-bound.** Measured on
+  the same share: 10000 x 64 KiB lands at 31–38 MB/s for every engine
+  (robocopy ≈ interleaved ≈ dir-sharded — per-directory sharding buys nothing
+  remotely, there is no local NTFS create-lock in the path). Upload parity
+  holds end-to-end (native ≈ robocopy ~5.5 s for 4000 files; first-contact
+  run can be ~2x, ignore it). Delete on the share: sequential ~400 files/s,
+  8 threads ~1400 (3.5x), 16 threads ~1650 (+15–20% over 8 — latency keeps
+  scaling where local NTFS stopped at 8). kDelThreads stays 8: the local
+  measurement says 16 is sometimes worse there, and a per-path thread count is
+  complexity the +15% doesn't buy. Same-share move = rename, ~5 ms (robocopy
+  copies+deletes, 1.3–2 s).
 - **No CPU/cache tuning (AMD X3D etc.).** Copying is I/O- and NTFS-metadata-
   bound; nothing revisits cache lines. Same unmeasurable-heuristic trap as the
   HDD detection below.
 
 ## Load-bearing gotchas
 
+- **The volume queue serializes transfers per drive** (`VolumeLock.cpp`): one
+  named mutex `Local\AngelCopyVol_<letter>` per drive, held for the whole
+  transfer. A job locks every source+dest volume before copying, so two runs on
+  the same slow disk don't thrash it. Load-bearing details, none optional:
+  - **A mutex, NOT a lock file.** If a runner is killed mid-transfer (I did this
+    to the user twice — see [[never-kill-running-transfers]]) or crashes, the OS
+    hands the next waiter `WAIT_ABANDONED` and it proceeds. A lock file would
+    wedge the queue forever after exactly the failure that is most likely here.
+  - **Volumes are acquired in sorted order** (`VolumesForPaths` sorts) — the
+    single global lock order is what makes it deadlock-free. Never acquire out
+    of order.
+  - **The lock lives in `RunUI`'s worker wrapper, on the engine thread**, so the
+    "Waiting…" state shows in the dialog and Cancel / "Start anyway" stay live.
+    A mirror holds it across BOTH phases (copy + purge) — the wrapper wraps the
+    whole two-phase worker, don't split it.
+  - `--console` is NOT queued (scripts manage their own concurrency);
+    `ANGELCOPY_NO_QUEUE=1` disables it everywhere. The "Start anyway" button is
+    one-shot (`forceStart`), never persisted.
 - **A LEFT drag onto a folder CANNOT be intercepted by any supported means.**
   `Directory\shellex\DropHandler` is *not* consulted for folders — the shell
   serves folder drops from its own internal `IDropTarget`. Proven by
@@ -240,16 +297,62 @@ build.bat                                             REM -> dist\*.dll, *.exe
   source was still in the page cache — a warm-cache run measures nothing.
 - **Never use robocopy to delete.** Measured: `/MIR` empty-mirror with `/MT:64`
   (908 ms) == `/MT:1` (919 ms) — robocopy does not parallelize its purge phase,
-  and plain `rm -rf` (792 ms) beats both. Deletion is NTFS-metadata bound;
-  parallelism buys ~20% at best (8 workers) and gets worse past that. `Delete.cpp`
-  is a plain recursive deleter on purpose. The ~3x win over Explorer is purely
+  and plain `rm -rf` (792 ms) beats both. The ~3x win over Explorer is purely
   from skipping shell overhead (SHFileOperation 1836 ms vs ours 580 ms).
+  - **`Delete.cpp` IS the dir-sharded 8-thread pool** (July 2026): streaming
+    walk feeds one directory's files per 256-file chunk to 8 workers, real
+    directories are removed bottom-up afterwards, reparse points are removed
+    as links inline. Bench scenario D's "sequential recursive (Delete.cpp
+    today)" label is the OLD algorithm kept as the bench baseline, not the
+    shipping code.
+  - **How much delete parallelism buys is DISK-DEPENDENT — measure per disk.**
+    An early NVMe measurement of naive (non-sharded) parallelism said "~20% at
+    best"; dir-sharded sharding changed that. Measured July 2026 on D: (850
+    EVO SATA, 95% full), 10000-file tree, scenario D: old sequential 6.5–8.2k
+    files/s, dir-sharded 8 threads 22.5–30.5k files/s — **3–4x**; 16 threads
+    add nothing over 8 (sometimes worse). Before touching kDelThreads, re-run
+    scenario D on the target disk — do not extrapolate between disks.
 - **Delete never offers the Recycle Bin.** The bin requires `IFileOperation`,
   i.e. Explorer's own engine (2473 ms measured) — there is nothing to win, so
   offering it would be a lie. Delete FAST is permanent-only and always confirms.
 - **The deleter must not follow reparse points.** Junctions/symlinks are removed
   with `RemoveDirectoryW`, never recursed into — recursing would delete the
   link target's contents (someone else's data). There is a test for this.
+- **Installer `[Run]` entries MUST carry `runasoriginaluser`.** Setup elevates
+  (`PrivilegesRequired=admin`) and `[Run]` inherits that token — without the
+  flag the agent ran at HIGH integrity all session (measured), so every Ctrl+V
+  copy and Shift+Del delete it launched had admin rights, and UIPI blocked the
+  runner's balloon to it. `[UninstallRun]` does not support the flag; that one
+  restart stays elevated and is accepted (one-shot, product being removed).
+- **Reparse-point checks are needed on BOTH sides in the mirror.** `FindExtras`
+  once checked only the destination entry; a SOURCE-side junction was entered,
+  and since the copy phase skips source junctions the purge compared the
+  destination against the LINK TARGET and deleted the difference. Covered by
+  `tests\test_sync.cpp` ("source-side junction is never traversed").
+- **Every tree walk must use the `\\?\` prefix — enumeration AND stat, not just
+  the I/O.** The copy/scan/mirror walkers once enumerated with a bare
+  `srcDir + L"\\*"` while the copy used `ExtPath`; a path past MAX_PATH then made
+  `FindFirstFile`/`GetFileAttributes` fail, so the scan silently dropped files
+  (copy reported complete but short) and — worse — in a mirror an existing
+  source read as "missing" and its destination twin was purged. `Ext`/`ExtPath`
+  now wraps every `FindFirstFileExW` pattern and every attribute query in
+  `ScanTree`, `FindExtras`, `ClassifyFile` and `WalkStream`. Never add a walk
+  that stats an un-prefixed path. This also covers the *helpers*: `IsDirectory`
+  (a long source folder read as a file → planned as a loose-file job → copied
+  nothing), `Exists` (`UniqueCopyName` overwrote an existing "… - Kopie"), the
+  loose-file stat in `RunNativeJobs`, and the rename probes. Regression:
+  `tests\test_native.cpp` "Long paths" — note it needs a long SOURCE ROOT, not
+  just a deep tree, to exercise `IsDirectory`.
+- **Recursion is depth-capped (`kMaxDepth`/`kMaxWalkDepth`/`kMaxScanDepth` = 900)**
+  in every walker. `\\?\` paths allow thousands of nesting levels; without the
+  cap a crafted deep tree overflows the ~1 MB stack and crashes mid-operation.
+  The mirror-extras walk stops WITHOUT emitting extras at the cap — an unscanned
+  level must never have its destination entries deleted as "missing".
+- **Every command-line argument to the runner is quoted with `QuoteArg`**
+  (Common.cpp), which doubles a trailing run of backslashes. A drive-root target
+  ("D:\") otherwise becomes `"D:\"`, whose `\"` is an escaped quote that merges
+  the following @list argument in. Source paths still go through the temp list
+  file, never the command line (no filename injection possible).
 - **Byte progress comes from `GetProcessIoCounters`, NOT from robocopy's output.**
   robocopy's stdout is a pipe, so its CRT buffers in 4 KB blocks: one huge file
   emits ~100 bytes of text and we receive *nothing* until the process exits — the
@@ -338,7 +441,11 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **The dialog only auto-closes on a clean, complete run.** Anything skipped
   (`SkipInfo::any()`) or any error keeps it open with a Close button, so the user
   sees what happened. When everything is skipped `total == 0` — that must render
-  as 100%, not 0%.
+  as 100%, not 0%. The **"Keep window open when done" checkbox** additionally
+  turns the clean-run auto-close into Done+Close; its state is global
+  (`HKCU\Software\AngelCOPY\KeepOpenAfterDone`) and saved on every toggle, not
+  on exit — a killed process must not lose the choice. The completion summary
+  always ends with the wall-clock duration.
 - **Win11 context menu:** classic `IContextMenu` shows under *Show more options*,
   not the main flyout. Main-menu placement needs an MSIX/`IExplorerCommand`
   package — deliberately out of scope for this unsigned personal build.

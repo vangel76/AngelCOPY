@@ -97,6 +97,12 @@ bool RemoveDir(const std::wstring& dir, const DeleteSink& sink) {
 constexpr int    kDelThreads = 8;
 constexpr size_t kDelChunkFiles = 256;
 
+// Cap recursion so a pathologically deep tree (\\?\ paths allow ~32k chars,
+// i.e. thousands of nesting levels) can't overflow the ~1 MB stack and crash
+// the process mid-delete. At the cap we stop descending and report it as an
+// error rather than crash. No normal tree comes near this.
+constexpr int    kMaxDepth = 900;
+
 struct DelItem {
     std::wstring path;
     unsigned long long size;
@@ -137,8 +143,14 @@ struct DelQueue {
 // links inline, never followed. Real directories are collected post-order for
 // the sequential bottom-up removal afterwards.
 void WalkDelete(const std::wstring& dir, const DeleteSink& sink, DelQueue& q,
-                std::vector<std::wstring>& dirsPost, std::atomic<bool>& ok) {
+                std::vector<std::wstring>& dirsPost, std::atomic<bool>& ok,
+                int depth = 0) {
     if (Cancelled(sink)) return;
+    if (depth >= kMaxDepth) {
+        ReportError(sink, dir, ERROR_STACK_OVERFLOW);
+        ok = false;
+        return;
+    }
 
     std::vector<DelItem> run;
     auto flush = [&] {
@@ -167,7 +179,7 @@ void WalkDelete(const std::wstring& dir, const DeleteSink& sink, DelQueue& q,
                     if (!RemoveDir(child, sink)) ok = false;
                 } else {
                     flush(); // keep chunks single-directory
-                    WalkDelete(child, sink, q, dirsPost, ok);
+                    WalkDelete(child, sink, q, dirsPost, ok, depth + 1);
                 }
             } else {
                 unsigned long long size =
@@ -219,7 +231,9 @@ bool DeleteTree(const std::wstring& dir, const DeleteSink& sink) {
     return ok.load();
 }
 
-void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog) {
+void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog,
+              int depth = 0) {
+    if (depth >= kMaxDepth) return; // matches WalkDelete's cap; stop descending
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((Ext(dir) + L"\\*").c_str(), FindExInfoBasic, &fd,
                                 FindExSearchNameMatch, nullptr, 0);
@@ -232,7 +246,7 @@ void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             acc.dirs += 1;
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-                ScanTree(child, acc, prog);
+                ScanTree(child, acc, prog, depth + 1);
         } else {
             acc.files += 1;
             acc.bytes += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;

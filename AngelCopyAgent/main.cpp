@@ -103,8 +103,9 @@ HWND ExplorerTargetOrNull() {
     if (!ClassIs(fg, L"CabinetWClass") && !ClassIs(fg, L"ExploreWClass"))
         return nullptr;
     GUITHREADINFO gti{sizeof(gti)};
-    if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti) &&
-        gti.hwndFocus) {
+    if (!GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti))
+        return nullptr; // can't tell where focus is -> fail safe: native paste
+    if (gti.hwndFocus) {
         wchar_t cls[64]{};
         GetClassNameW(gti.hwndFocus, cls, 64);
         CharUpperW(cls);
@@ -134,7 +135,27 @@ WPARAM InterceptReason(HWND* outTarget) {
 HWND g_pasteTarget = nullptr;  // set by the hook, read by the main thread
 HWND g_deleteTarget = nullptr;
 
+// Key-repeat suppression. Holding Ctrl+V / Shift+Del auto-repeats WM_KEYDOWN;
+// without this each repeat launched another copy process / delete dialog on the
+// same target. Set when we swallow a keydown, cleared on the matching keyup.
+LONG g_vHeld = 0;
+LONG g_delHeld = 0;
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION) {
+        const KBDLLHOOKSTRUCT* kk = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+        // Clear the held-flags OUTSIDE the enabled gate. If the user unticks
+        // "Enabled" in the tray while a key is still down, the keyup would
+        // otherwise never be seen and the flag would strand at 1 — swallowing
+        // the next Ctrl+V silently, with nothing launched.
+        if ((wp == WM_KEYUP || wp == WM_SYSKEYUP) && !(kk->flags & LLKHF_INJECTED)) {
+            if (kk->vkCode == 'V') {
+                if (InterlockedExchange(&g_vHeld, 0) == 1) return 1; // balance
+            } else if (kk->vkCode == VK_DELETE) {
+                if (InterlockedExchange(&g_delHeld, 0) == 1) return 1;
+            }
+        }
+    }
     if (nCode == HC_ACTION && InterlockedCompareExchange(&g_enabled, 0, 0)) {
         const KBDLLHOOKSTRUCT* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && k->vkCode == 'V' &&
@@ -149,12 +170,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
                 WPARAM reason = InterceptReason(&target);
                 if (g_debug) PostMessageW(g_msgWnd, WM_APP_DEBUG, reason, 0);
                 if (reason == 0) {
-                    g_pasteTarget = target;
-                    PostMessageW(g_msgWnd, WM_APP_PASTE, 0, 0);
+                    // Swallow auto-repeats without re-launching: post only on
+                    // the first keydown of a physical press.
+                    if (InterlockedExchange(&g_vHeld, 1) == 0) {
+                        g_pasteTarget = target;
+                        PostMessageW(g_msgWnd, WM_APP_PASTE, 0, 0);
+                    }
                     return 1; // swallow: heavy lifting happens off the hook
                 }
             }
         }
+        // (keyup balancing for V/Delete happens above, outside this gate)
         // Shift+Delete -> permanent delete of the current selection via our
         // engine (confirmation + parallel delete). Only files, never edit
         // focus (Shift+Del there deletes text). Selection is fetched on the
@@ -169,8 +195,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
             if (shift && !ctrl && !alt && !win) {
                 HWND target = ExplorerTargetOrNull();
                 if (target) {
-                    g_deleteTarget = target;
-                    PostMessageW(g_msgWnd, WM_APP_DELETE, 0, 0);
+                    if (InterlockedExchange(&g_delHeld, 1) == 0) {
+                        g_deleteTarget = target;
+                        PostMessageW(g_msgWnd, WM_APP_DELETE, 0, 0);
+                    }
                     return 1;
                 }
             }
@@ -505,6 +533,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     // Single instance: a second launch (e.g. installer re-run) just exits.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"AngelCopyAgentSingleton");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (mutex) CloseHandle(mutex); // a handle is returned even when it exists
         CoUninitialize();
         return 0;
     }
