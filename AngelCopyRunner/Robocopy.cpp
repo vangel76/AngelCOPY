@@ -3,8 +3,12 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <algorithm>
+#include <condition_variable>
 #include <cwctype>
+#include <deque>
 #include <map>
+#include <mutex>
+#include <thread>
 
 #pragma comment(lib, "Shlwapi.lib")
 
@@ -324,13 +328,74 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
 // identically, so totals and copy stay consistent.
 constexpr int kMaxScanDepth = 900;
 
-void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
-              ScanResult& acc, ScanProgress* prog, int depth = 0) {
+// (The former single-threaded ScanTree lives on as WalkForScan below: same
+// walk, but the expensive per-file destination stats fan out to a pool.)
+
+} // namespace
+
+// ---- parallel destination classification ----------------------------------
+// The scan's cost is NOT the source enumeration — it is the one destination
+// stat per file (ClassifyFile), a latency-bound metadata round-trip that on a
+// slow USB/SMB target dominates "Preparing" entirely. Latency parallelizes:
+// the delete pool measured 3.5x with 8 threads on exactly this kind of load.
+// So the walk (producer) stays single-threaded and cheap, while the per-file
+// classification fans out to a small pool. Each worker accumulates into its
+// own ScanResult; results merge at the end (order inside conflictSample is
+// arbitrary anyway). 8 threads mirrors kDelThreads — same bound, same disk
+// behavior (re-measure per target before changing, as ever).
+
+namespace {
+
+constexpr int kScanThreads = 8;
+
+struct ScanFileItem {
+    std::wstring src, dst;
+    unsigned long long size;
+    FILETIME mtime;
+};
+
+struct ScanQueue {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::vector<ScanFileItem>> q;
+    bool closed = false;
+
+    void Push(std::vector<ScanFileItem>&& batch) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            q.push_back(std::move(batch));
+        }
+        cv.notify_one();
+    }
+    bool Pop(std::vector<ScanFileItem>& out) {
+        std::unique_lock<std::mutex> l(m);
+        cv.wait(l, [&] { return closed || !q.empty(); });
+        if (q.empty()) return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
+    }
+    void Close() {
+        {
+            std::lock_guard<std::mutex> l(m);
+            closed = true;
+        }
+        cv.notify_all();
+    }
+};
+
+// Walk one tree, pushing per-directory batches of files that still need the
+// destination stat. Files under a missing destination dir are accounted
+// directly as Lonely (no stat needed, no batch).
+void WalkForScan(const std::wstring& srcDir, const std::wstring& dstDir,
+                 ScanResult& lonelyAcc, ScanProgress* prog, ScanQueue& queue,
+                 int depth, bool dstExists) {
     if (depth >= kMaxScanDepth) return;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW(Ext(srcDir + L"\\*").c_str(), FindExInfoBasic,
                                 &fd, FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
+    std::vector<ScanFileItem> batch;
     do {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
@@ -338,34 +403,82 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue; // /XJ
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
             IsExcludedDir(fd.cFileName))
-            continue; // /XD: excluded folder — not scanned, not copied
+            continue; // /XD
 
         std::wstring src = srcDir + L"\\" + fd.cFileName;
         std::wstring dst = dstDir + L"\\" + fd.cFileName;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ScanTree(src, dst, acc, prog, depth + 1);
+            bool childDst = dstExists && IsDirectory(dst);
+            WalkForScan(src, dst, lonelyAcc, prog, queue, depth + 1, childDst);
         } else {
             if (prog) prog->files.fetch_add(1, std::memory_order_relaxed);
             unsigned long long size =
                 ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            unsigned long long dstSize = 0;
-            FileClass fc = ClassifyFile(dst, size, fd.ftLastWriteTime, dstSize);
-            Account(acc, fc, size, dstSize, src, dst);
+            if (!dstExists) {
+                Account(lonelyAcc, FileClass::Lonely, size, 0, src, dst);
+            } else {
+                batch.push_back(ScanFileItem{std::move(src), std::move(dst),
+                                             size, fd.ftLastWriteTime});
+            }
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+    if (!batch.empty()) queue.Push(std::move(batch));
+}
+
+void MergeScan(ScanResult& into, ScanResult& from) {
+    into.lonelyBytes += from.lonelyBytes;   into.lonelyFiles += from.lonelyFiles;
+    into.sameBytes += from.sameBytes;       into.sameFiles += from.sameFiles;
+    into.newerBytes += from.newerBytes;     into.newerFiles += from.newerFiles;
+    into.olderBytes += from.olderBytes;     into.olderFiles += from.olderFiles;
+    into.newerGrowBytes += from.newerGrowBytes;
+    into.olderGrowBytes += from.olderGrowBytes;
+    into.conflicts += from.conflicts;
+    for (auto& s : from.conflictSample)
+        if (into.conflictSample.size() < kConflictSampleMax)
+            into.conflictSample.push_back(std::move(s));
+    auto app = [](std::vector<std::wstring>& a, std::vector<std::wstring>& b) {
+        a.insert(a.end(), std::make_move_iterator(b.begin()),
+                 std::make_move_iterator(b.end()));
+    };
+    app(into.samePaths, from.samePaths);
+    app(into.newerPaths, from.newerPaths);
+    app(into.olderPaths, from.olderPaths);
 }
 
 } // namespace
 
 ScanResult ScanJobs(const std::vector<RoboJob>& jobs, ScanProgress* prog) {
     ScanResult r;
+    // Pool + queue live across all whole-tree jobs so one warm-up serves all.
+    ScanQueue queue;
+    std::vector<ScanResult> local(kScanThreads);
+    std::vector<std::thread> pool;
+    for (int t = 0; t < kScanThreads; ++t)
+        pool.emplace_back([&queue, &local, t, prog] {
+            std::vector<ScanFileItem> batch;
+            while (queue.Pop(batch))
+                for (auto& it : batch) {
+                    if (prog && prog->cancel.load(std::memory_order_relaxed))
+                        return;
+                    unsigned long long dstSize = 0;
+                    FileClass fc =
+                        ClassifyFile(it.dst, it.size, it.mtime, dstSize);
+                    Account(local[t], fc, it.size, dstSize, it.src, it.dst);
+                }
+        });
+
     for (const RoboJob& job : jobs) {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (job.files.empty()) {
-            // Whole-tree job: srcDir maps onto dstDir.
-            ScanTree(job.srcDir, job.dstDir, r, prog);
+            // Whole-tree job: srcDir maps onto dstDir. If the destination root
+            // doesn't exist (fresh backup), the whole tree is Lonely and every
+            // per-file destination stat is skipped — the scan collapses to a
+            // source-only walk, which is what makes "Preparing" fast on a slow
+            // target. Otherwise the stats fan out to the pool above.
+            WalkForScan(job.srcDir, job.dstDir, r, prog, queue, 0,
+                        IsDirectory(job.dstDir));
         } else {
             for (size_t i = 0; i < job.files.size(); ++i) {
                 const std::wstring& f = job.files[i];
@@ -384,6 +497,10 @@ ScanResult ScanJobs(const std::vector<RoboJob>& jobs, ScanProgress* prog) {
             }
         }
     }
+
+    queue.Close();
+    for (auto& t : pool) t.join();
+    for (auto& l : local) MergeScan(r, l);
     return r;
 }
 

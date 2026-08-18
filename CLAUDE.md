@@ -176,6 +176,18 @@ build.bat                                             REM -> dist\*.dll, *.exe
   a live file counter (`ScanProgress`, threaded through ScanJobs / ScanExtras /
   ScanDelete) and only becomes visible after ~300 ms so small transfers never
   flash it. Cancel during the scan aborts with nothing touched.
+- **The scan's cost is the DESTINATION stat, not the source walk — and it is
+  skipped or parallelized** (measured, 10000 files vs SMB): destination folder
+  absent → every file is provably Lonely, zero dest stats, scan 10.5 s → 0.01 s
+  (`dstExists` threaded through `WalkForScan`, one dir-existence check replaces
+  one stat per file; false only ever cascades downward). Destination present →
+  stats fan out to `kScanThreads = 8` workers (`ScanQueue`, per-dir batches,
+  per-worker `ScanResult` merged at the end): 10.5 s → ~2 s, 5x. Same
+  latency-bound reasoning and thread count as the deleter — re-measure per
+  target before changing. `WalkStream` has the matching engine-side shortcut:
+  a dest dir it just CREATED (`dstFresh`, from CreateDirectoryEx not returning
+  ALREADY_EXISTS) classifies everything as Lonely without stats. Keep scan and
+  engine decisions identical or totals drift (existing gotcha below).
 - **GUI moves try `TryQuickRenameMove` BEFORE any scan**: a whole-tree move
   whose destination doesn't exist can't conflict, so a same-volume drag of a
   500k-file folder completes instantly with no window at all (Explorer-style).

@@ -176,11 +176,20 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
         ReportError(sink, srcDir, ERROR_STACK_OVERFLOW);
         return;
     }
+    // `dstFresh`: this call CREATED the destination directory, so nothing can
+    // exist inside it — every file below is Lonely by construction and the
+    // per-file ClassifyFile destination stat (one round-trip per file; the
+    // dominant cost on a slow USB/network target) is skipped.
+    bool dstFresh = true;
     if (!CreateDirectoryExW(ExtPath(srcDir).c_str(), ExtPath(dstDir).c_str(),
-                            nullptr) &&
-        GetLastError() != ERROR_ALREADY_EXISTS) {
-        if (!CreateDirectoryW(ExtPath(dstDir).c_str(), nullptr) &&
-            GetLastError() != ERROR_ALREADY_EXISTS) {
+                            nullptr)) {
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            dstFresh = false;
+        } else if (CreateDirectoryW(ExtPath(dstDir).c_str(), nullptr)) {
+            // created via the plain fallback: still fresh
+        } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            dstFresh = false;
+        } else {
             ReportError(sink, dstDir, GetLastError());
             return; // nothing below can succeed
         }
@@ -219,7 +228,11 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
                 unsigned long long size =
                     ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 unsigned long long dstSize = 0;
-                FileClass fc = ClassifyFile(dst, size, fd.ftLastWriteTime, dstSize);
+                // Freshly created dir -> Lonely by construction, no dest stat.
+                FileClass fc = dstFresh
+                                   ? FileClass::Lonely
+                                   : ClassifyFile(dst, size, fd.ftLastWriteTime,
+                                                  dstSize);
                 Item it{std::move(src), std::move(dst), size};
                 if (PolicySkips(policy, fc)) {
                     if (sink.onSkip) sink.onSkip(it.src, it.size);

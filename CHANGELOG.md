@@ -4,7 +4,26 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.0] — 2026-08-18
+
+### Changed
+- **"Preparing" is dramatically faster.** The pre-transfer scan's cost was one
+  destination stat per source file — a latency-bound round-trip that dominated
+  on USB/network targets while the source walk itself is cheap. Three fixes,
+  all measured with 10000 files against an SMB target:
+  - **Fresh destination = no stats at all.** If the destination folder doesn't
+    exist, every file is provably new — the scan collapses to a source-only
+    walk: **10.5 s → 0.01 s**. A fresh backup now starts copying about as fast
+    as bare robocopy, with the full progress bar intact.
+  - Per-directory existence check replaces per-file stats: a subtree missing at
+    the destination is skipped statlessly.
+  - Where stats are still needed (re-copy/re-mirror over existing data), they
+    now fan out to an 8-thread pool: **10.5 s → 1.9-2.2 s (5x)**. Same
+    dir-sharded pattern and thread count as the deleter, same latency-bound
+    reasoning; classification results verified identical.
+  - The native engine's own walk got the matching shortcut: a destination
+    directory it just created cannot contain conflicts, so per-file
+    classification is skipped there too.
 
 ### Added
 - **Unreal Engine preset — skip regenerable cache folders.** When a source
