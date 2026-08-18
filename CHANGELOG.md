@@ -4,6 +4,21 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Unreal Engine preset — skip regenerable cache folders.** When a source
+  folder holds a `.uproject`, copy and mirror offer to skip `DerivedDataCache`,
+  `Intermediate`, `Saved` and `Binaries` (the folders from a hand-run
+  `robocopy /XD` line) — usually the bulk of a project's files. Auto-detected,
+  shown as a checkbox (default on) before the transfer; the choice is not
+  persisted. Excluded folders are skipped in the copy AND in the mirror-purge:
+  an excluded folder present at the destination is never deleted, exactly like
+  robocopy `/XD`. Console runs never prompt and never exclude (scripts filter
+  themselves). Covered by `tests\test_sync.cpp` (purge-safety, adversarially
+  validated) and `tests\test_native.cpp` (the copy walk skips the whole
+  subtree).
+
 ## [1.2.0] — 2026-07-20
 
 ### Added

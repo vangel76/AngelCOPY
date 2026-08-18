@@ -204,6 +204,9 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
                 continue;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                IsExcludedDir(fd.cFileName))
+                continue; // /XD: excluded folder — must match ScanTree exactly
 
             std::wstring src = srcDir + L"\\" + fd.cFileName;
             std::wstring dst = dstDir + L"\\" + fd.cFileName;

@@ -21,6 +21,8 @@ constexpr int CH = 300;
 struct State {
     bool confirmed = false;
     HFONT font = nullptr, fontBold = nullptr;
+    HWND chk = nullptr;       // optional checkbox (Unreal preset); null elsewhere
+    bool chkChecked = false;  // its state, latched when the user confirms
 };
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -36,7 +38,13 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
     case WM_COMMAND:
         if (!st) break;
-        if (LOWORD(wp) == ID_DELETE) { st->confirmed = true; DestroyWindow(hwnd); return 0; }
+        if (LOWORD(wp) == ID_DELETE) {
+            st->confirmed = true;
+            if (st->chk)
+                st->chkChecked = SendMessageW(st->chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            DestroyWindow(hwnd);
+            return 0;
+        }
         if (LOWORD(wp) == IDCANCEL) { st->confirmed = false; DestroyWindow(hwnd); return 0; }
         break;
     case WM_CLOSE:
@@ -156,6 +164,95 @@ bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeByte
     if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
     if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
     return st.confirmed;
+}
+
+// Unreal preset. Detected a .uproject in the source → offer to skip the
+// regenerable cache folders. The checkbox defaults ON. Continue proceeds with
+// the checkbox's state; Cancel/closing aborts the whole transfer.
+UnrealChoice AskUnrealPreset() {
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = Proc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = theme::BgBrush();
+    wc.lpszClassName = L"AngelCopyUnreal";
+    RegisterClassW(&wc);
+
+    const int cw = 520, ch = 200;
+    const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT rc{0, 0, cw, ch};
+    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
+    int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
+                                loc::T(loc::S::UnrealCaption), kStyle,
+                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    if (!hwnd) return {true, false}; // can't ask -> cancel (safe default)
+
+    State st;
+    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
+        LOGFONTW b = ncm.lfMessageFont;
+        b.lfWeight = FW_SEMIBOLD;
+        st.fontBold = CreateFontIndirectW(&b);
+    }
+    if (!st.fontBold) st.fontBold = st.font;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
+
+    HWND lblHead = CreateWindowW(L"STATIC", loc::T(loc::S::UnrealHead),
+                                 WS_CHILD | WS_VISIBLE, 16, 16, cw - 32, 20, hwnd,
+                                 nullptr, hInst, nullptr);
+    HWND lblBody = CreateWindowW(L"STATIC", loc::T(loc::S::UnrealBody),
+                                 WS_CHILD | WS_VISIBLE, 16, 40, cw - 32, 40, hwnd,
+                                 nullptr, hInst, nullptr);
+    st.chk = CreateWindowW(L"BUTTON", loc::T(loc::S::UnrealChk),
+                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                           16, 88, cw - 32, 20, hwnd, nullptr, hInst, nullptr);
+    SendMessageW(st.chk, BM_SETCHECK, BST_CHECKED, 0); // default: skip caches
+
+    const int by = 148, bh = 30;
+    HWND bGo = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnContinue),
+                             WS_CHILD | WS_VISIBLE | theme::ButtonStyle(true), 16,
+                             by, 150, bh, hwnd, (HMENU)(INT_PTR)ID_DELETE, hInst,
+                             nullptr);
+    HWND bCancel = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnCancel),
+                                 WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false),
+                                 cw - 116, by, 100, bh, hwnd,
+                                 (HMENU)(INT_PTR)IDCANCEL, hInst, nullptr);
+
+    SetFont(lblHead, st.fontBold);
+    SetFont(lblBody, st.font);
+    SetFont(st.chk, st.font);
+    SetFont(bGo, st.font);
+    SetFont(bCancel, st.font);
+
+    theme::ApplyToWindow(hwnd);
+    for (HWND b : {st.chk, bGo, bCancel}) theme::ApplyToControl(b);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(bGo);
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+
+    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
+    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    return {!st.confirmed, st.confirmed && st.chkChecked};
 }
 
 // Mirror confirmation. Shares the window class/pattern with the delete prompt:

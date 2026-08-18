@@ -20,4 +20,12 @@ bool AskSyncConfirm(unsigned long long copyFiles, unsigned long long copyBytes,
 // the default and closing the window does not proceed. Returns true to proceed.
 bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeBytes);
 
+// Unreal preset offer, shown when a .uproject is found in the source. The
+// checkbox ("skip cache folders") defaults on. Cancel/closing aborts.
+struct UnrealChoice {
+    bool cancelled = false;   // user aborted the whole transfer
+    bool skipCaches = false;  // apply the DerivedDataCache/Intermediate/... /XD
+};
+UnrealChoice AskUnrealPreset();
+
 } // namespace angelcopy

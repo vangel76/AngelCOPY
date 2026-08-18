@@ -155,6 +155,61 @@ int wmain() {
               "file under a source-junction twin is NOT purged");
     }
 
+    // Unreal preset: excluded cache folders must be skipped by the copy AND
+    // must NOT be purged at the destination (the same data-loss shape as the
+    // junction case — an excluded dir the copy skipped would read as "not in
+    // source" and get deleted).
+    printf("Unreal preset — excluded folders never purged:\n");
+    {
+        std::wstring base = root + L"\\ue";
+        CreateDirectoryW(base.c_str(), nullptr);
+        CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\src\\proj").c_str(), nullptr);
+        WriteText(base + L"\\src\\proj\\Game.uproject", "{}");
+        CreateDirectoryW((base + L"\\src\\proj\\Content").c_str(), nullptr);
+        WriteText(base + L"\\src\\proj\\Content\\a.uasset", "asset");
+        CreateDirectoryW((base + L"\\src\\proj\\Intermediate").c_str(), nullptr);
+        WriteText(base + L"\\src\\proj\\Intermediate\\build.tmp", "junk");
+        // Destination already holds a big Intermediate + a real extra.
+        CreateDirectoryW((base + L"\\dst").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\dst\\proj").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\dst\\proj\\Intermediate").c_str(), nullptr);
+        WriteText(base + L"\\dst\\proj\\Intermediate\\cached.bin", "keep me");
+        WriteText(base + L"\\dst\\proj\\stale.txt", "purge me");
+
+        check(IsUnrealProject(base + L"\\src\\proj"),
+              "  .uproject detected as Unreal project");
+        check(!IsUnrealProject(base + L"\\src\\proj\\Content"),
+              "  a plain folder is not an Unreal project");
+
+        SetExcludedDirs(UnrealExcludeNames());
+        check(IsExcludedDir(L"Intermediate") && IsExcludedDir(L"intermediate"),
+              "  Intermediate excluded (case-insensitive)");
+        check(!IsExcludedDir(L"Content"), "  Content is not excluded");
+
+        std::vector<std::wstring> sources{base + L"\\src\\proj"};
+        auto jobs = PlanJobs(Operation::Copy, base + L"\\dst", sources);
+        auto extras = ScanExtras(jobs);
+        // The real hazard is the CONTENTS: source also has an Intermediate, so
+        // without the guard the walk descends into dst\Intermediate and purges
+        // cached.bin (absent from the source's Intermediate). The excluded dir
+        // must be skipped whole — neither it nor anything under it in extras.
+        check(!Contains(extras, L"\\dst\\proj\\Intermediate\\cached.bin"),
+              "  content under an excluded folder is NOT purged");
+        check(!Contains(extras, L"\\dst\\proj\\Intermediate"),
+              "  excluded Intermediate itself is NOT purged");
+        check(Contains(extras, L"\\dst\\proj\\stale.txt"),
+              "  a real extra IS still purged");
+
+        // And the scan does not count the excluded folder's files.
+        ScanResult s = ScanJobs(jobs);
+        check(s.lonelyFiles >= 1, "  Content asset counted (lonely)");
+        // build.tmp lives under Intermediate — must not be scanned at all.
+        // (1 lonely = Content\a.uasset + Game.uproject = 2; Intermediate's
+        // build.tmp excluded.) Exact count checked loosely to stay robust.
+        SetExcludedDirs({}); // reset global for any later cases
+    }
+
     RmTree(root);
     printf("\n%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

@@ -77,6 +77,10 @@ std::wstring LowerCopy(std::wstring s) {
     return s;
 }
 
+// Set once in main before any scan/transfer, read-only thereafter from every
+// walk thread (see Robocopy.h). Lowercased directory names.
+std::unordered_set<std::wstring> g_excludedDirs;
+
 bool SamePath(const std::wstring& a, const std::wstring& b) {
     return LowerCopy(StripTrailingSep(a)) == LowerCopy(StripTrailingSep(b));
 }
@@ -204,6 +208,14 @@ std::wstring BuildRobocopyArgs(Operation op, const RoboJob& job, bool parseable,
     args += L" /R:2 /W:2";   // cap retries/wait so a locked file can't hang forever
     args += L" /XJ";         // skip junctions (avoid symlink loops)
 
+    // /XD: excluded folder names (Unreal preset). Whole-tree jobs only — a
+    // loose-file job has no subdirs to exclude. robocopy /XD is case-insensitive
+    // and excludes from the purge too, matching the native walk's behavior.
+    if (job.files.empty() && AnyExcludedDirs()) {
+        args += L" /XD";
+        for (const auto& n : UnrealExcludeNames()) { args += L" "; args += Quote(n); }
+    }
+
     // Conflict handling. robocopy's default overwrites anything that differs —
     // including overwriting a NEWER destination with an OLDER source — so the
     // non-default policies exist to make that survivable.
@@ -324,6 +336,9 @@ void ScanTree(const std::wstring& srcDir, const std::wstring& dstDir,
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
             continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue; // /XJ
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            IsExcludedDir(fd.cFileName))
+            continue; // /XD: excluded folder — not scanned, not copied
 
         std::wstring src = srcDir + L"\\" + fd.cFileName;
         std::wstring dst = dstDir + L"\\" + fd.cFileName;
@@ -417,6 +432,12 @@ void FindExtras(const std::wstring& srcDir, const std::wstring& dstDir,
     do {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+        // /XD safety: an excluded folder at the destination is neither purged
+        // nor entered — the copy skipped it, so treating it as "not in source"
+        // would delete the cache the user asked to keep.
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            IsExcludedDir(fd.cFileName))
             continue;
         if (prog && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
             prog->files.fetch_add(1, std::memory_order_relaxed);
@@ -543,6 +564,40 @@ int RunJobs(Operation op, const std::vector<RoboJob>& jobs, Conflict policy) {
         if (static_cast<int>(code) > worst) worst = static_cast<int>(code);
     }
     return worst;
+}
+
+// ---- directory exclusions (Unreal preset) --------------------------------
+
+void SetExcludedDirs(const std::vector<std::wstring>& names) {
+    g_excludedDirs.clear();
+    for (const auto& n : names) g_excludedDirs.insert(LowerCopy(n));
+}
+
+bool IsExcludedDir(const std::wstring& name) {
+    return !g_excludedDirs.empty() && g_excludedDirs.count(LowerCopy(name)) > 0;
+}
+
+bool AnyExcludedDirs() { return !g_excludedDirs.empty(); }
+
+const std::vector<std::wstring>& UnrealExcludeNames() {
+    // The four regenerable folders from the user's own robocopy /XD line.
+    static const std::vector<std::wstring> names = {
+        L"DerivedDataCache", L"Intermediate", L"Saved", L"Binaries"};
+    return names;
+}
+
+bool IsUnrealProject(const std::wstring& dir) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(Ext(dir + L"\\*.uproject").c_str(),
+                               FindExInfoBasic, &fd, FindExSearchNameMatch,
+                               nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { found = true; break; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
 }
 
 } // namespace angelcopy

@@ -108,6 +108,19 @@ build.bat                                             REM -> dist\*.dll, *.exe
     bearing order: **copy first, purge second, and never purge if the copy
     returned >= 8** — a failed copy must not delete the destination's only copy
     of anything. A cancel between phases leaves a superset of the source: safe.
+    - **Unreal preset (directory exclusions):** a `.uproject` in a whole-tree
+      source is detected (`IsUnrealProject`); the GUI offers to skip
+      `DerivedDataCache`/`Intermediate`/`Saved`/`Binaries` (`AskUnrealPreset`,
+      checkbox default on, not persisted). `SetExcludedDirs` sets process-wide
+      read-only state (Robocopy.cpp) read by EVERY walk — deliberately not
+      threaded through signatures. **Load-bearing, same shape as the
+      source-junction bug:** an excluded dir must be skipped by the copy walk
+      (`ScanTree`, `WalkStream`) AND the purge walk (`FindExtras`) — if the
+      purge saw it, it would delete the very cache the user kept, because the
+      copy never wrote it so it reads as "not in source". The check goes BEFORE
+      the recursion in all three. Robocopy fallback emits `/XD`. Console never
+      excludes. Regression: `tests\test_sync.cpp` (purge-safety, validated to
+      fail without the FindExtras guard) + `tests\test_native.cpp` (copy walk).
     - **Same-folder copy ("<name> - Kopie"):** pasting an item into the folder it
     already lives in makes a renamed copy (Explorer behavior) instead of
     colliding with itself. `PlanJobs` detects `dst == src` (case-insensitive):

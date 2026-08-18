@@ -114,6 +114,13 @@ enum class S {
     HeadWaiting,       // heading while queued behind another transfer
     BtnStartAnyway,    // "run in parallel this once"
 
+    // ---- Unreal preset (skip regenerable cache folders) ----
+    UnrealCaption,
+    UnrealHead,
+    UnrealChk,         // checkbox: skip the cache folders (names appended in code)
+    UnrealBody,
+    BtnContinue,
+
     COUNT
 };
 

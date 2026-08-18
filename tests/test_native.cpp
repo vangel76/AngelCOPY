@@ -531,6 +531,37 @@ static void TestLongPaths() {
     RmTree(base);
 }
 
+// The native copy engine must skip excluded folders (Unreal preset), matching
+// the scan. Verifies WalkStream honors IsExcludedDir end-to-end.
+static void TestExcludeDirs() {
+    printf("Excluded folders (Unreal preset):\n");
+    std::wstring base = g_root + L"\\excl";
+    RmTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+    CreateDirectoryW((base + L"\\src\\Content").c_str(), nullptr);
+    WriteFileText(base + L"\\src\\Content\\a.uasset", "asset", 0);
+    CreateDirectoryW((base + L"\\src\\Intermediate").c_str(), nullptr);
+    WriteFileText(base + L"\\src\\Intermediate\\junk.tmp", "junk", 0);
+    CreateDirectoryW((base + L"\\src\\Intermediate\\deep").c_str(), nullptr);
+    WriteFileText(base + L"\\src\\Intermediate\\deep\\more.tmp", "more", 0);
+
+    SetExcludedDirs(UnrealExcludeNames());
+    std::vector<std::wstring> sources{base + L"\\src"};
+    auto jobs = PlanJobs(Operation::Copy, base + L"\\dst", sources, L"Copy");
+    Counts c;
+    RunNativeJobs(Operation::Copy, jobs, Conflict::Replace, c.Sink());
+    SetExcludedDirs({}); // reset global
+
+    check(Exists(base + L"\\dst\\src\\Content\\a.uasset"),
+          "  Content copied");
+    check(!Exists(base + L"\\dst\\src\\Intermediate"),
+          "  Intermediate folder NOT copied (whole subtree skipped)");
+    check(c.files.load() == 1, "  exactly one file copied (only the asset)");
+    check(c.errors.load() == 0, "  no errors");
+    RmTree(base);
+}
+
 int wmain() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -550,6 +581,7 @@ int wmain() {
     TestCancel();
     TestSameFolderCopy();
     TestLongPaths();
+    TestExcludeDirs();
 
     RmTree(g_root);
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

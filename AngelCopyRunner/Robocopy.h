@@ -141,4 +141,27 @@ SkipInfo SkippedFor(const ScanResult& s, Conflict policy);
 // robocopy exit code seen (robocopy: 0-7 = success bit-flags, >=8 = failure).
 int RunJobs(Operation op, const std::vector<RoboJob>& jobs, Conflict policy);
 
+// ---- directory exclusions (the Unreal preset) ----------------------------
+// A set of directory NAMES (matched at any depth, case-insensitive) skipped
+// entirely — copy AND mirror-purge, exactly like robocopy /XD. This is
+// process-wide state set ONCE in main before any scan/transfer and read
+// read-only by every walk thereafter (both engines), so it isn't threaded
+// through every walker signature. Empty by default -> nothing excluded, which
+// is what the unit tests get.
+//
+// Load-bearing: an excluded dir must be invisible to BOTH the copy walk and
+// the extras/purge walk. If the purge saw it (present at the destination,
+// "not in source because we skipped it") it would DELETE the very cache the
+// user asked to keep — the same data-loss shape as the source-junction bug.
+void SetExcludedDirs(const std::vector<std::wstring>& names); // lowercased inside
+bool IsExcludedDir(const std::wstring& name);
+bool AnyExcludedDirs();
+
+// The Unreal cache/derived folders the preset skips (proper case, for display
+// and for SetExcludedDirs).
+const std::vector<std::wstring>& UnrealExcludeNames();
+
+// True if `dir` looks like an Unreal project root: it holds a *.uproject file.
+bool IsUnrealProject(const std::wstring& dir);
+
 } // namespace angelcopy

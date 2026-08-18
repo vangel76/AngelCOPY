@@ -206,6 +206,22 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<RoboJob> jobs =
         PlanJobs(op, dest, sources, loc::T(loc::S::CopyWord));
 
+    // Unreal preset (GUI only): a .uproject in a whole-tree source → offer to
+    // skip the regenerable cache folders. Decided BEFORE the scan so totals,
+    // conflicts and space all reflect the exclusion; SetExcludedDirs is then
+    // read by both engines' walks (copy AND mirror-purge). Console runs never
+    // prompt and never exclude — scripts manage their own filtering.
+    if (!consoleMode) {
+        bool unreal = false;
+        for (const auto& j : jobs)
+            if (j.files.empty() && IsUnrealProject(j.srcDir)) { unreal = true; break; }
+        if (unreal) {
+            UnrealChoice uc = AskUnrealPreset();
+            if (uc.cancelled) return 0; // aborted before anything was touched
+            if (uc.skipCaches) SetExcludedDirs(UnrealExcludeNames());
+        }
+    }
+
     // ---- sync (mirror): confirmed copy + purge ----
     if (sync) {
         if (consoleMode) {

@@ -104,6 +104,12 @@ const wchar_t* kEn[] = {
     // volume queue
     L"Waiting for another AngelCOPY transfer on the same drive\x2026",
     L"Start anyway (run in parallel)",
+    // Unreal preset
+    L"AngelCOPY \x2014 Unreal project",
+    L"Unreal project detected.",
+    L"Skip regenerable cache folders (DerivedDataCache, Intermediate, Saved, Binaries)",
+    L"These rebuild from the project and bloat the copy \x2014 skipping them is much faster.",
+    L"Continue",
 };
 
 const wchar_t* kDe[] = {
@@ -206,6 +212,12 @@ const wchar_t* kDe[] = {
     // volume queue
     L"Wartet auf anderen AngelCOPY-Vorgang auf demselben Laufwerk\x2026",
     L"Trotzdem starten (parallel)",
+    // Unreal preset
+    L"AngelCOPY \x2014 Unreal-Projekt",
+    L"Unreal-Projekt erkannt.",
+    L"Cache-Ordner überspringen (DerivedDataCache, Intermediate, Saved, Binaries)",
+    L"Diese lassen sich aus dem Projekt neu erzeugen und blähen die Kopie stark auf \x2014 überspringen ist viel schneller.",
+    L"Weiter",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");
