@@ -843,8 +843,17 @@ void UpdateUi(UiState* ui) {
     // ETA uses the overall average, NOT the sliding window: the window reacts to
     // every burst and makes the estimate jump around uselessly. The average so
     // far also already accounts for enumeration overhead, which the rest incurs
-    // too. Skipped volume is excluded — it costs microseconds, not time.
+    // too. Skips are NOT free of time (each costs a destination stat; on a
+    // skip-heavy re-mirror they ARE the runtime — the byte-only estimate read
+    // "--:--" for minutes there), so the ETA is the LARGER of the byte-based
+    // and the file-based projection: an all-skip run gets a real countdown from
+    // its file rate, a mixed run can't lowball its skip tail, and a single huge
+    // file (files 0/1, no file rate) still gets the byte estimate.
     double eta = avgRate > 1 ? (double)(rateTotal - rateUnit) / avgRate : -1;
+    if (!itemsRate && elapsed > 1.0 && dFiles > 0 && tFiles > dFiles) {
+        double etaFiles = (double)(tFiles - dFiles) / ((double)dFiles / elapsed);
+        if (etaFiles > eta) eta = etaFiles;
+    }
 
     // total == 0 means nothing had to be copied (all skipped) — that is
     // complete, not 0%. Likewise the band must read full once finished, even if

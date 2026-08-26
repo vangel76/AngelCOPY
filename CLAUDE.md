@@ -188,6 +188,18 @@ build.bat                                             REM -> dist\*.dll, *.exe
   a dest dir it just CREATED (`dstFresh`, from CreateDirectoryEx not returning
   ALREADY_EXISTS) classifies everything as Lonely without stats. Keep scan and
   engine decisions identical or totals drift (existing gotcha below).
+- **Engine-side classification is DEFERRED into the copy pool** (`Item::classify`
+  + mtime): under `!dstFresh` the walk enqueues small files unclassified and the
+  pool worker does the `ClassifyFile` dest stat and the skip-vs-copy decision.
+  Inline classification on the walk thread made a skip-heavy re-mirror run at
+  ONE thread's stat rate while all 16 workers idled (a 123k-file Unreal
+  re-mirror crawled for minutes; deferred: 20k all-skip files in 0.16 s). Big
+  files stay inline-classified — they must be routed to the ring by the walk.
+- **ETA is max(byte projection, file projection).** Byte-only ETA read "--:--"
+  through entire skip phases (skips DO cost time — one dest stat each — the
+  "skips cost microseconds" assumption was wrong on skip-heavy runs). The file
+  projection uses doneFiles (which counts skips); a single huge file (0/1
+  files) still falls back to the byte estimate. Speed stays copied-bytes-only.
 - **GUI moves try `TryQuickRenameMove` BEFORE any scan**: a whole-tree move
   whose destination doesn't exist can't conflict, so a same-volume drag of a
   500k-file folder completes instantly with no window at all (Explorer-style).

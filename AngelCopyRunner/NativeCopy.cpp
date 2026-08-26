@@ -113,6 +113,11 @@ bool PolicySkips(Conflict policy, FileClass fc) {
 struct Item {
     std::wstring src, dst;
     unsigned long long size = 0;
+    // Deferred classification (see WalkStream): the pool worker stats the
+    // destination instead of the walk thread, so a skip-heavy re-mirror
+    // parallelizes its stats instead of serializing them on the walk.
+    FILETIME mtime{};
+    bool classify = false;
 };
 
 struct Plan {
@@ -227,18 +232,32 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
             } else {
                 unsigned long long size =
                     ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                unsigned long long dstSize = 0;
-                // Freshly created dir -> Lonely by construction, no dest stat.
-                FileClass fc = dstFresh
-                                   ? FileClass::Lonely
-                                   : ClassifyFile(dst, size, fd.ftLastWriteTime,
-                                                  dstSize);
                 Item it{std::move(src), std::move(dst), size};
-                if (PolicySkips(policy, fc)) {
-                    if (sink.onSkip) sink.onSkip(it.src, it.size);
-                } else if (size >= kBigFileBytes) {
-                    bigs.push_back(std::move(it));
+                if (size >= kBigFileBytes) {
+                    // Big files are rare: classify inline (they must be routed
+                    // to the ring here, a worker can't do that).
+                    unsigned long long dstSize = 0;
+                    FileClass fc = dstFresh
+                                       ? FileClass::Lonely
+                                       : ClassifyFile(it.dst, size,
+                                                      fd.ftLastWriteTime, dstSize);
+                    if (PolicySkips(policy, fc)) {
+                        if (sink.onSkip) sink.onSkip(it.src, it.size);
+                    } else {
+                        bigs.push_back(std::move(it));
+                    }
                 } else {
+                    // Freshly created dir -> Lonely by construction, no dest
+                    // stat anywhere. Otherwise classification is DEFERRED to
+                    // the pool worker: the dest stat is one round-trip per
+                    // file, and on a skip-heavy re-mirror those stats ARE the
+                    // runtime — serial on the walk thread they idled all 16
+                    // workers (measured: the whole transfer ran at one
+                    // thread's stat rate).
+                    if (!dstFresh) {
+                        it.mtime = fd.ftLastWriteTime;
+                        it.classify = true;
+                    }
                     run.push_back(std::move(it));
                     if (run.size() >= kChunkFiles) flush();
                 }
@@ -689,6 +708,18 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                     while (queue.Pop(chunk))
                         for (const Item& it : chunk) {
                             if (Cancelled(sink)) return;
+                            if (it.classify) {
+                                // Deferred dest stat (see WalkStream): decide
+                                // skip-vs-copy here so 16 workers share the
+                                // stat cost instead of the walk thread alone.
+                                unsigned long long dstSize = 0;
+                                FileClass fc = ClassifyFile(it.dst, it.size,
+                                                            it.mtime, dstSize);
+                                if (PolicySkips(policy, fc)) {
+                                    if (sink.onSkip) sink.onSkip(it.src, it.size);
+                                    continue;
+                                }
+                            }
                             if (ProcessItem(it, op, sink)) anyCopied = true;
                             else if (!Cancelled(sink)) anyError = true;
                         }

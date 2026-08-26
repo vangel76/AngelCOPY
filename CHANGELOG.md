@@ -4,6 +4,22 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Skip-heavy mirrors no longer crawl.** Re-mirroring a mostly-unchanged tree
+  (e.g. a huge Unreal project with 100 changed files) spent its entire runtime
+  doing one destination stat per file — serially, on the walk thread, while all
+  16 copy workers idled. Classification of small files is now deferred into the
+  copy pool, so skip decisions run 16-wide like everything else (measured:
+  20000 all-skip files in 0.16 s locally).
+- **"Restdauer: --:--" during skip phases.** The ETA was computed from copied
+  bytes only, on the assumption that skips cost no time — false on skip-heavy
+  runs, where it showed no estimate for minutes. The ETA is now the larger of
+  the byte-based and the file-based projection: all-skip runs get a real
+  countdown, mixed runs can't underestimate their skip tail, and a single huge
+  file still gets the byte estimate.
+
 ## [1.3.0] — 2026-08-18
 
 ### Changed
