@@ -4,7 +4,7 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.1] — 2026-08-26
 
 ### Fixed
 - **Skip-heavy mirrors no longer crawl.** Re-mirroring a mostly-unchanged tree
