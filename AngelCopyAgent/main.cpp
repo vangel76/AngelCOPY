@@ -417,8 +417,26 @@ void ShowDoneBalloon(const wchar_t* body) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// Windows silently REMOVES a WH_KEYBOARD_LL hook whose callback once exceeds
+// LowLevelHooksTimeout (system load, a disk waking up — one slow tick in days
+// of uptime suffices). The agent then looks alive (tray, balloons) but Ctrl+V
+// and Shift+Del are native again. There is no API to ask whether the hook
+// still exists, so it is re-registered periodically — the PowerToys approach.
+// Unhook+rehook is microseconds; the interval is the worst-case dead window.
+constexpr UINT_PTR kRehookTimer = 1;
+constexpr UINT     kRehookMs = 30 * 1000;
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        // Branch on the timer id (see the ProgressUI WM_TIMER gotcha).
+        if (wp == kRehookTimer) {
+            if (g_hook) UnhookWindowsHookEx(g_hook);
+            g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                       GetModuleHandleW(nullptr), 0);
+            return 0;
+        }
+        break;
     case WM_COPYDATA: {
         const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)lp;
         if (cds && cds->dwData == 1 && cds->lpData && cds->cbData >= sizeof(wchar_t)) {
@@ -555,6 +573,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInst, 0);
     // No hook -> agent is useless but harmless; keep the tray so the user can
     // see it and exit. Ctrl+V stays native either way (fail-open).
+    // Periodic re-hook (see kRehookTimer): recovers from Windows silently
+    // dropping the hook after one slow callback.
+    SetTimer(g_msgWnd, kRehookTimer, kRehookMs, nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0)) {

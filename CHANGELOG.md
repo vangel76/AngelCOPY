@@ -4,6 +4,22 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Ctrl+V / Shift+Del silently reverting to native after long uptime.**
+  Windows removes a low-level keyboard hook whose callback once exceeds the
+  system timeout (one slow tick — a disk waking, load spike — in days of
+  uptime suffices); the agent looked alive (tray, balloons) but intercepted
+  nothing. There is no API to detect the removal, so the agent re-registers
+  its hook every 30 seconds (the PowerToys approach) — worst-case dead window
+  is now the interval, not "until the next reboot".
+- **The delete confirmation count no longer crawls on big trees.** The
+  pre-delete scan walked directories serially — one FindFirstFile round-trip
+  at a time, latency-bound on network/USB exactly like deletion itself. It now
+  runs on the same 8-worker directory queue as the deleter (counts verified
+  identical; 10000 files in 15 ms locally).
+
 ## [1.3.1] — 2026-08-26
 
 ### Fixed

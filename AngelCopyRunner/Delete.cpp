@@ -231,8 +231,32 @@ bool DeleteTree(const std::wstring& dir, const DeleteSink& sink) {
     return ok.load();
 }
 
-void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog,
-              int depth = 0) {
+// The pre-delete count is pure enumeration (sizes come free with the find
+// data), so its cost is one FindFirstFile round-trip per directory —
+// latency-bound on network/USB targets exactly like deletion itself. The
+// serial recursive walk counted one directory at a time; the confirmation on
+// a big tree made the user wait for minutes. Same cure as the deleter: a
+// directory-granular work queue over kDelThreads workers, each accumulating
+// into its own DeleteScan, merged at the end.
+struct ScanWork {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::pair<std::wstring, int>> q; // dir, depth
+    int active = 0;   // directories currently being enumerated
+    bool done = false;
+
+    void Push(std::wstring dir, int depth) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            q.emplace_back(std::move(dir), depth);
+        }
+        cv.notify_one();
+    }
+};
+
+// Enumerate ONE directory into acc; subdirectories go back on the queue.
+void ScanOneDir(const std::wstring& dir, int depth, DeleteScan& acc,
+                ScanWork& work, ScanProgress* prog) {
     if (depth >= kMaxDepth) return; // matches WalkDelete's cap; stop descending
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((Ext(dir) + L"\\*").c_str(), FindExInfoBasic, &fd,
@@ -242,11 +266,10 @@ void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog,
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
             continue;
-        std::wstring child = dir + L"\\" + fd.cFileName;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             acc.dirs += 1;
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-                ScanTree(child, acc, prog, depth + 1);
+                work.Push(dir + L"\\" + fd.cFileName, depth + 1);
         } else {
             acc.files += 1;
             acc.bytes += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
@@ -261,6 +284,7 @@ void ScanTree(const std::wstring& dir, DeleteScan& acc, ScanProgress* prog,
 DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
                       ScanProgress* prog) {
     DeleteScan s;
+    ScanWork work;
     for (const auto& raw : targets) {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         std::wstring t = StripSep(raw);
@@ -271,7 +295,8 @@ DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
         if (attr == INVALID_FILE_ATTRIBUTES) continue;
         if (attr & FILE_ATTRIBUTE_DIRECTORY) {
             s.dirs += 1;
-            if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) ScanTree(t, s, prog);
+            if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT))
+                work.q.emplace_back(t, 0); // pre-pool: no lock needed yet
         } else {
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             if (GetFileAttributesExW(Ext(t).c_str(), GetFileExInfoStandard, &fa)) {
@@ -280,6 +305,39 @@ DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
                 if (prog) prog->files.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
+    if (work.q.empty()) return s;
+
+    std::vector<DeleteScan> local(kDelThreads);
+    std::vector<std::thread> pool;
+    for (int t = 0; t < kDelThreads; ++t)
+        pool.emplace_back([&, t] {
+            for (;;) {
+                std::unique_lock<std::mutex> l(work.m);
+                work.cv.wait(l, [&] { return work.done || !work.q.empty(); });
+                if (work.q.empty()) return; // done and drained
+                std::wstring dir = std::move(work.q.front().first);
+                int depth = work.q.front().second;
+                work.q.pop_front();
+                ++work.active;
+                l.unlock();
+                // On cancel just drain the queue; no further enumeration.
+                if (!(prog && prog->cancel.load(std::memory_order_relaxed)))
+                    ScanOneDir(dir, depth, local[t], work, prog);
+                l.lock();
+                --work.active;
+                // Last one out: queue empty and nobody left who could refill it.
+                if (work.q.empty() && work.active == 0) {
+                    work.done = true;
+                    work.cv.notify_all();
+                }
+            }
+        });
+    for (auto& th : pool) th.join();
+    for (const auto& l : local) {
+        s.files += l.files;
+        s.dirs += l.dirs;
+        s.bytes += l.bytes;
     }
     return s;
 }

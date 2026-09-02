@@ -291,6 +291,12 @@ build.bat                                             REM -> dist\*.dll, *.exe
     CabinetWClass/ExploreWClass, `IsClipboardFormatAvailable(CF_HDROP)`, focus
     class). COM folder resolution happens on the main thread AFTER the
     swallow. A slow callback gets the hook silently removed by Windows.
+  - **The hook is RE-REGISTERED every 30 s** (`kRehookTimer`): even a cheap
+    callback exceeds LowLevelHooksTimeout once in days of uptime (load spike,
+    disk waking) and Windows removes the hook with no error and no API to
+    detect it — the agent looks alive but intercepts nothing (happened live,
+    Aug 2026). Unhook+rehook is microseconds; don't remove the timer, and
+    branch WM_TIMER on the timer id (same trap as ProgressUI).
   - **Fail-open everywhere:** resolution failure (virtual folder, zip, This
     PC) REPLAYS Ctrl+V via SendInput; the hook ignores `LLKHF_INJECTED`
     events so the replay can't loop. Agent dead/absent -> native Ctrl+V.
@@ -339,7 +345,12 @@ build.bat                                             REM -> dist\*.dll, *.exe
   - **`Delete.cpp` IS the dir-sharded 8-thread pool** (July 2026): streaming
     walk feeds one directory's files per 256-file chunk to 8 workers, real
     directories are removed bottom-up afterwards, reparse points are removed
-    as links inline. Bench scenario D's "sequential recursive (Delete.cpp
+    as links inline. **`ScanDelete` (the confirmation count) runs on the same
+    8-worker directory queue** (Aug 2026) — the serial recursive count made
+    the delete prompt take minutes on latency-bound targets; the count is pure
+    enumeration (sizes come free with the find data), so directory-granular
+    parallelism is the whole win. Reparse points are counted but never
+    entered, same as the deleter. Bench scenario D's "sequential recursive (Delete.cpp
     today)" label is the OLD algorithm kept as the bench baseline, not the
     shipping code.
   - **How much delete parallelism buys is DISK-DEPENDENT — measure per disk.**
