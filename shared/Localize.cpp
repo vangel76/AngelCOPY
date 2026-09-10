@@ -88,7 +88,7 @@ const wchar_t* kEn[] = {
     L"%llu %s found so far",
     // agent
     L"AngelCOPY \x2014 Explorer shortcuts",
-    L"Intercept Ctrl+V and Shift+Del in Explorer",
+    L"Intercept Ctrl+V, Shift+Del and Alt+Enter in Explorer",
     L"Exit",
     // same-folder copy
     L"Copy",
@@ -110,6 +110,23 @@ const wchar_t* kEn[] = {
     L"Skip regenerable cache folders (DerivedDataCache, Intermediate, Saved, Binaries)",
     L"These rebuild from the project and bloat the copy \x2014 skipping them is much faster.",
     L"Continue",
+    // properties dialog
+    L"Properties FAST (AngelCOPY)",
+    L"Fast size and file count (AngelCOPY engine)",
+    L"AngelCOPY \x2014 Properties",
+    L"%llu items selected",
+    L"Contents: %llu %s, %llu %s",
+    L"Size: %s (%llu bytes)",
+    L"On disk: %s",
+    L"Created: %s",
+    L"Modified: %s",
+    L"Attributes: %s",
+    L"Windows properties\x2026",
+    L"Compute size on disk",
+    L"Directory", L"Read-only", L"Hidden", L"System", L"Archive",
+    L"Compressed",
+    // tray guide
+    L"Open guide",
 };
 
 const wchar_t* kDe[] = {
@@ -196,7 +213,7 @@ const wchar_t* kDe[] = {
     L"Bisher %llu %s gefunden",
     // agent
     L"AngelCOPY \x2014 Explorer-Tastenkürzel",
-    L"Strg+V und Umschalt+Entf im Explorer abfangen",
+    L"Strg+V, Umschalt+Entf und Alt+Eingabe im Explorer abfangen",
     L"Beenden",
     // same-folder copy
     L"Kopie",
@@ -218,6 +235,23 @@ const wchar_t* kDe[] = {
     L"Cache-Ordner überspringen (DerivedDataCache, Intermediate, Saved, Binaries)",
     L"Diese lassen sich aus dem Projekt neu erzeugen und blähen die Kopie stark auf \x2014 überspringen ist viel schneller.",
     L"Weiter",
+    // properties dialog
+    L"Eigenschaften FAST (AngelCOPY)",
+    L"Größe und Dateianzahl schnell zählen (AngelCOPY-Engine)",
+    L"AngelCOPY \x2014 Eigenschaften",
+    L"%llu Elemente ausgewählt",
+    L"Inhalt: %llu %s, %llu %s",
+    L"Größe: %s (%llu Bytes)",
+    L"Belegt: %s",
+    L"Erstellt: %s",
+    L"Geändert: %s",
+    L"Attribute: %s",
+    L"Windows-Eigenschaften\x2026",
+    L"Belegt berechnen",
+    L"Verzeichnis", L"Schreibgeschützt", L"Versteckt", L"System", L"Archiv",
+    L"Komprimiert",
+    // tray guide
+    L"Anleitung öffnen",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");
@@ -246,6 +280,11 @@ const wchar_t* NounFile(unsigned long long n) {
 const wchar_t* NounFoldersIn(unsigned long long n) {
     // German dative plural after "in": "in 1 Ordner", "in 2 Ordnern".
     if (UseGerman()) return n == 1 ? L"Ordner" : L"Ordnern";
+    return n == 1 ? L"folder" : L"folders";
+}
+
+const wchar_t* NounFolders(unsigned long long n) {
+    if (UseGerman()) return L"Ordner"; // nominative: same in both numbers
     return n == 1 ? L"folder" : L"folders";
 }
 

@@ -46,4 +46,5 @@ private:
     UINT m_idPaste = 0xFFFFFFFF;
     UINT m_idSync = 0xFFFFFFFF;  // mirror clipboard folders into the target
     UINT m_idDelete = 0xFFFFFFFF;
+    UINT m_idProps = 0xFFFFFFFF; // fast properties (folders / multi-selection)
 };

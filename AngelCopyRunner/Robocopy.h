@@ -14,6 +14,10 @@ namespace angelcopy {
 // then be discarded by the caller.
 struct ScanProgress {
     std::atomic<unsigned long long> files{0};
+    // Live dirs/bytes are fed by the delete/properties count (ScanDelete,
+    // ScanAllocated); the copy scans only tick `files`. All monotonic.
+    std::atomic<unsigned long long> dirs{0};
+    std::atomic<unsigned long long> bytes{0};
     std::atomic<long> cancel{0};
 };
 

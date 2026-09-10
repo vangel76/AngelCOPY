@@ -4,6 +4,39 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-09-10
+
+### Added
+- **Fast properties (Alt+Enter / "Properties FAST").** Explorer's properties
+  dialog counts a folder's contents serially through shell items; AngelCOPY's
+  replacement opens instantly and counts on the same 8-worker parallel scan as
+  the delete prompt — files, folders and size tick live. Alt+Enter in Explorer
+  now opens it for folders and multi-selections (single files deliberately
+  keep the native sheet — it is instant and has all the tabs); right-click
+  offers "Properties FAST" under the same rule. "Compute size on disk" is a
+  button (cluster-rounded, true allocation for compressed/sparse files —
+  Explorer's figure), not always-on, because it can cost an extra round-trip
+  per file. "Windows properties…" opens the original sheet for everything not
+  rebuilt on purpose: Security, Sharing, Previous Versions, Details.
+  Console: `AngelCopyRunner --console props <targets>` prints
+  files/dirs/bytes/alloc. The tray toggle now reads "Ctrl+V, Shift+Del and
+  Alt+Enter".
+- **App icon.** White "AC" on orange (`assets\AngelCOPY.ico`, resource id 1
+  via `shared\AppIcon.rc`) — the tray icon is no longer the blank stock one,
+  and the runner/agent exes, the taskbar and the installer carry it too.
+
+### Fixed
+- **Tray icon vanished after an Explorer restart** — including the restart
+  the installer itself performs right after starting the agent, so a fresh
+  install often showed no icon at all (the hooks kept working). Explorer
+  discards all tray icons when it rebuilds the taskbar and broadcasts
+  `TaskbarCreated`; the agent now re-adds its icon on that message.
+- **Guide: "What is AngelCOPY" intro + tray access.** The quick guide now
+  opens with a plain-language overview of what AngelCOPY does, and the tray
+  menu gained "Open guide" (Anleitung öffnen) — the guide is always two
+  clicks away, alongside the existing Start-menu shortcut and the
+  post-install page.
+
 ## [Unreleased]
 
 ### Fixed

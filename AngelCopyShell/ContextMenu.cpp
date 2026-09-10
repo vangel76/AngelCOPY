@@ -113,6 +113,24 @@ IFACEMETHODIMP CContextMenu::QueryContextMenu(HMENU hMenu, UINT indexMenu,
         ++id; ++pos; ++added;
     }
 
+    // Properties FAST: only where counting is the pain — a folder or a
+    // multi-selection. A single file's native sheet is instant and complete;
+    // no entry there (Alt+Enter passes single files through for the same
+    // reason).
+    if (!m_sources.empty() && id <= idCmdLast) {
+        bool anyDir = m_sources.size() > 1;
+        for (const auto& s : m_sources) {
+            if (anyDir) break;
+            anyDir = PathIsDirectoryW(s.c_str()) != FALSE;
+        }
+        if (anyDir) {
+            InsertMenuW(hMenu, pos, MF_BYPOSITION | MF_STRING, id,
+                        loc::T(loc::S::MenuProps));
+            m_idProps = id - idCmdFirst;
+            ++id; ++pos; ++added;
+        }
+    }
+
     return MAKE_HRESULT(SEVERITY_SUCCESS, FACILITY_NULL, added);
 }
 
@@ -146,6 +164,10 @@ IFACEMETHODIMP CContextMenu::InvokeCommand(CMINVOKECOMMANDINFO* pici) {
         // The runner prompts before touching anything; never delete from here.
         return angel::LaunchRunner(L"delete", L"", m_sources) ? S_OK : E_FAIL;
     }
+    if (offset == m_idProps) {
+        // Read-only: the runner opens the fast properties dialog.
+        return angel::LaunchRunner(L"props", L"", m_sources) ? S_OK : E_FAIL;
+    }
     return E_FAIL;
 }
 
@@ -161,6 +183,7 @@ IFACEMETHODIMP CContextMenu::GetCommandString(UINT_PTR idCmd, UINT uType, UINT*,
                                     : loc::S::HelpCopyHere);
     if (idCmd == m_idSync)   help = loc::T(loc::S::HelpSyncHere);
     if (idCmd == m_idDelete) help = loc::T(loc::S::HelpDelete);
+    if (idCmd == m_idProps)  help = loc::T(loc::S::HelpProps);
     if (!help) return E_INVALIDARG;
 
     if (uType == GCS_HELPTEXTW) {

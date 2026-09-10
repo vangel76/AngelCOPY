@@ -23,6 +23,11 @@ cd /d "%~dp0"
 if not exist dist mkdir dist
 if not exist build mkdir build
 
+rem App icon (white AC on orange): compiled once, linked into runner + agent —
+rem gives the exes their Explorer icon, the tray icon and the taskbar icon.
+rc /nologo /fo build\AppIcon.res shared\AppIcon.rc
+if errorlevel 1 exit /b 1
+
 rem /utf-8 is required: shared\Localize.cpp holds German strings, and without it
 rem MSVC reads the sources in the local ANSI codepage and mangles the umlauts.
 echo [AngelCOPY] Compiling AngelCopyRunner.exe ...
@@ -31,10 +36,10 @@ cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
    AngelCopyRunner\NativeCopy.cpp ^
    AngelCopyRunner\ProgressUI.cpp AngelCopyRunner\ConflictUI.cpp ^
    AngelCopyRunner\ConfirmUI.cpp AngelCopyRunner\Delete.cpp ^
-   AngelCopyRunner\VolumeLock.cpp ^
+   AngelCopyRunner\VolumeLock.cpp AngelCopyRunner\PropsUI.cpp ^
    shared\Localize.cpp shared\Theme.cpp ^
    /Fe:dist\AngelCopyRunner.exe ^
-   /link /MANIFEST:EMBED Shlwapi.lib Comctl32.lib Gdi32.lib User32.lib Advapi32.lib Ole32.lib
+   /link /MANIFEST:EMBED build\AppIcon.res Shlwapi.lib Comctl32.lib Gdi32.lib User32.lib Advapi32.lib Ole32.lib Shell32.lib
 if errorlevel 1 exit /b 1
 rem /MANIFEST:EMBED is load-bearing: the ComCtl32 v6 dependency must live INSIDE
 rem the exe. As an external .manifest it works only while that file sits next to
@@ -45,7 +50,7 @@ echo [AngelCOPY] Compiling AngelCopyAgent.exe ...
 cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
    AngelCopyAgent\main.cpp AngelCopyShell\Common.cpp shared\Localize.cpp ^
    /Fe:dist\AngelCopyAgent.exe ^
-   /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
+   /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED build\AppIcon.res ^
    User32.lib Shell32.lib Shlwapi.lib Ole32.lib OleAut32.lib
 if errorlevel 1 exit /b 1
 

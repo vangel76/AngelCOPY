@@ -52,8 +52,10 @@ constexpr UINT WM_APP_PASTE = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr UINT WM_APP_DEBUG = WM_APP + 3; // wParam = reason code (see DbgLog)
 constexpr UINT WM_APP_DELETE = WM_APP + 4;
+constexpr UINT WM_APP_PROPS = WM_APP + 5; // Alt+Enter -> fast properties
 constexpr UINT ID_TRAY_TOGGLE = 1;
 constexpr UINT ID_TRAY_EXIT = 2;
+constexpr UINT ID_TRAY_GUIDE = 3;
 
 HWND g_msgWnd = nullptr;
 HHOOK g_hook = nullptr;
@@ -134,12 +136,14 @@ WPARAM InterceptReason(HWND* outTarget) {
 
 HWND g_pasteTarget = nullptr;  // set by the hook, read by the main thread
 HWND g_deleteTarget = nullptr;
+HWND g_propsTarget = nullptr;
 
 // Key-repeat suppression. Holding Ctrl+V / Shift+Del auto-repeats WM_KEYDOWN;
 // without this each repeat launched another copy process / delete dialog on the
 // same target. Set when we swallow a keydown, cleared on the matching keyup.
 LONG g_vHeld = 0;
 LONG g_delHeld = 0;
+LONG g_enterHeld = 0;
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION) {
@@ -153,6 +157,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
                 if (InterlockedExchange(&g_vHeld, 0) == 1) return 1; // balance
             } else if (kk->vkCode == VK_DELETE) {
                 if (InterlockedExchange(&g_delHeld, 0) == 1) return 1;
+            } else if (kk->vkCode == VK_RETURN) {
+                if (InterlockedExchange(&g_enterHeld, 0) == 1) return 1;
             }
         }
     }
@@ -198,6 +204,29 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
                     if (InterlockedExchange(&g_delHeld, 1) == 0) {
                         g_deleteTarget = target;
                         PostMessageW(g_msgWnd, WM_APP_DELETE, 0, 0);
+                    }
+                    return 1;
+                }
+            }
+        }
+        // Alt+Enter -> fast properties of the Explorer selection (or the
+        // current folder when nothing is selected). Arrives as WM_SYSKEYDOWN
+        // because Alt is held. Same laws as the other two: cheap checks only,
+        // resolution on the main thread, single files and failures are
+        // replayed native.
+        if (wp == WM_SYSKEYDOWN && k->vkCode == VK_RETURN &&
+            !(k->flags & LLKHF_INJECTED)) {
+            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            const bool win = ((GetAsyncKeyState(VK_LWIN) |
+                               GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+            if (alt && !ctrl && !shift && !win) {
+                HWND target = ExplorerTargetOrNull();
+                if (target) {
+                    if (InterlockedExchange(&g_enterHeld, 1) == 0) {
+                        g_propsTarget = target;
+                        PostMessageW(g_msgWnd, WM_APP_PROPS, 0, 0);
                     }
                     return 1;
                 }
@@ -367,6 +396,48 @@ void DoDelete() {
         ReplayShiftDelete();
 }
 
+// Give Alt+Enter back to Windows (native properties sheet). Same injected-
+// replay pattern as the other two shortcuts.
+void ReplayAltEnter() {
+    INPUT in[4]{};
+    for (auto& i : in) i.type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_MENU;
+    in[1].ki.wVk = VK_RETURN;
+    in[2].ki.wVk = VK_RETURN;
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].ki.wVk = VK_MENU;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+// Directory test that survives >MAX_PATH (the shell hands us plain paths).
+bool IsDirLong(const std::wstring& p) {
+    std::wstring x = (p.rfind(L"\\\\", 0) == 0) ? L"\\\\?\\UNC\\" + p.substr(2)
+                                                : L"\\\\?\\" + p;
+    DWORD a = GetFileAttributesW(x.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+void DoProps() {
+    HWND target = g_propsTarget;
+    if (!target) { ReplayAltEnter(); return; }
+    std::vector<std::wstring> paths;
+    if (!ResolveExplorerSelection(target, paths)) {
+        // Nothing selected: Explorer shows the CURRENT folder's properties —
+        // so do we, with our fast counter.
+        std::wstring folder = ResolveExplorerFolder(target);
+        if (folder.empty()) { ReplayAltEnter(); return; } // virtual: native
+        paths.assign(1, folder);
+    } else if (paths.size() == 1 && !IsDirLong(paths[0])) {
+        // A single FILE has nothing to count — the native sheet is instant
+        // and has all the tabs. Deliberate pass-through.
+        ReplayAltEnter();
+        return;
+    }
+    if (!angel::LaunchRunner(L"props", L"", paths))
+        ReplayAltEnter();
+}
+
 // ---- tray ------------------------------------------------------------------
 
 void TrayAdd(HWND hwnd) {
@@ -376,7 +447,13 @@ void TrayAdd(HWND hwnd) {
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // Our own icon (resource id 1, shared\AppIcon.rc) at the tray's small
+    // size; the stock IDI_APPLICATION fallback only if the resource is
+    // missing (hand-built exe without the .res).
+    nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
+                                  IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                  GetSystemMetrics(SM_CYSMICON), 0);
+    if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     lstrcpynW(nid.szTip, loc::T(loc::S::TrayTooltip), ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -389,10 +466,25 @@ void TrayRemove(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
+// Open the installed quick guide next to the agent's exe. Language picks the
+// file the installer shipped; if one is missing (hand-copied install), the
+// other is tried — better any guide than none.
+void OpenGuide() {
+    const bool de =
+        PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_GERMAN;
+    std::wstring dir = angel::ModuleDir();
+    const wchar_t* first = de ? L"AngelCOPY Anleitung.txt" : L"AngelCOPY Guide.txt";
+    const wchar_t* other = de ? L"AngelCOPY Guide.txt" : L"AngelCOPY Anleitung.txt";
+    std::wstring path = dir + L"\\" + first;
+    if (!PathFileExistsW(path.c_str())) path = dir + L"\\" + other;
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 void TrayMenu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), ID_TRAY_TOGGLE,
                 loc::T(loc::S::TrayEnabled));
+    AppendMenuW(m, MF_STRING, ID_TRAY_GUIDE, loc::T(loc::S::TrayGuide));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, loc::T(loc::S::TrayExit));
     POINT pt;
@@ -454,6 +546,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_DELETE:
         DoDelete();
         return 0;
+    case WM_APP_PROPS:
+        DoProps();
+        return 0;
     case WM_APP_DEBUG:
         DbgLog(wp);
         return 0;
@@ -464,6 +559,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == ID_TRAY_TOGGLE) {
             InterlockedExchange(&g_enabled, g_enabled ? 0 : 1);
+        } else if (LOWORD(wp) == ID_TRAY_GUIDE) {
+            OpenGuide();
         } else if (LOWORD(wp) == ID_TRAY_EXIT) {
             DestroyWindow(hwnd);
         }
@@ -471,6 +568,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         TrayRemove(hwnd);
         PostQuitMessage(0);
+        return 0;
+    }
+    // Explorer (re)built the taskbar: every tray icon was discarded and must
+    // be re-added NOW. Without this the icon vanishes on any Explorer restart
+    // — including the one the installer itself performs right after starting
+    // the agent (hook kept working, icon gone; happened live, Sep 2026).
+    static const UINT kTaskbarCreated =
+        RegisterWindowMessageW(L"TaskbarCreated");
+    if (msg == kTaskbarCreated) {
+        TrayAdd(hwnd);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

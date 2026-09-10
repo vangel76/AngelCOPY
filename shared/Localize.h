@@ -121,6 +121,25 @@ enum class S {
     UnrealBody,
     BtnContinue,
 
+    // ---- properties dialog (Alt+Enter / "Properties FAST") ----
+    // Appended at the end (positional tables).
+    MenuProps, HelpProps,
+    PropsCaption,
+    PropsMultiName,    // count ("%llu items selected")
+    PropsLineContent,  // files, nounFile, dirs, nounFolders
+    PropsLineSize,     // human bytes, exact bytes
+    PropsLineAlloc,    // human bytes (or a dash before it is computed)
+    PropsLineCreated,  // formatted datetime
+    PropsLineModified, // formatted datetime
+    PropsLineAttrs,    // comma-joined attribute words
+    BtnWinProps,       // opens the native Windows properties dialog
+    BtnCalcAlloc,      // starts the size-on-disk walk
+    AttrDirectory, AttrReadonly, AttrHidden, AttrSystem, AttrArchive,
+    AttrCompressed,
+
+    // ---- tray: open the quick guide ----
+    TrayGuide,
+
     COUNT
 };
 
@@ -135,5 +154,9 @@ const wchar_t* NounError(unsigned long long n);
 // needs the dative plural there ("in 2 Ordnern", not "in 2 Ordner"), so this
 // cannot be a generic folder noun — do not reuse it elsewhere.
 const wchar_t* NounFoldersIn(unsigned long long n);
+
+// Nominative folder noun ("2 Ordner" / "2 folders") — the properties dialog's
+// content line. Distinct from NounFoldersIn (dative).
+const wchar_t* NounFolders(unsigned long long n);
 
 } // namespace loc

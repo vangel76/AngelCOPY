@@ -1,6 +1,14 @@
 ﻿ANGELCOPY — QUICK GUIDE
 =======================
 
+WHAT IS ANGELCOPY?
+  AngelCOPY replaces Windows Explorer's slow copy, move and delete with its
+  own parallel engine — often several times faster with many small files,
+  and moves on the same drive finish almost instantly. You keep working the
+  way you always did: Ctrl+C/V, Shift+Del, Alt+Enter and the context menu —
+  AngelCOPY hooks in automatically. On top: Mirror (backup sync) and a fast
+  properties dialog. Anything risky (delete, mirror) ALWAYS asks first.
+
 COPY & PASTE
   1. Copy (Ctrl+C) or cut (Ctrl+X) files/folders as usual.
   2. Paste in the destination folder:
@@ -21,6 +29,13 @@ MIRROR
 DELETE
   Selection → right-click "Delete FAST" or Shift+Del.
   Permanent, NO Recycle Bin — it always asks first.
+
+PROPERTIES (FAST)
+  Folder or multi-selection → Alt+Enter or right-click "Properties FAST":
+  size and file count are counted in parallel — much faster than the
+  Windows dialog. "Compute size on disk" adds the on-disk figure,
+  "Windows properties…" opens the original (Security, Sharing, …).
+  Single files keep the normal Windows dialog.
 
 THE PROGRESS DIALOG
   • Green stretches in the bar = skipped (already up to date at the target).

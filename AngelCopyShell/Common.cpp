@@ -181,9 +181,11 @@ static std::wstring WriteTempList(const std::vector<std::wstring>& sources) {
 
 bool LaunchRunner(const wchar_t* op, const std::wstring& dest,
                   const std::vector<std::wstring>& sources) {
-    const bool isDelete = (_wcsicmp(op, L"delete") == 0);
+    // delete and props take no destination argument.
+    const bool noDest = (_wcsicmp(op, L"delete") == 0) ||
+                        (_wcsicmp(op, L"props") == 0);
     if (sources.empty()) return false;
-    if (!isDelete && dest.empty()) return false;
+    if (!noDest && dest.empty()) return false;
 
     std::wstring runner = RunnerPath();
     if (!PathFileExistsW(runner.c_str())) return false;
@@ -197,7 +199,7 @@ bool LaunchRunner(const wchar_t* op, const std::wstring& dest,
     std::wstring cmd = QuoteArg(runner) + L" ";
     cmd += op;
     cmd += L" ";
-    if (!isDelete) cmd += QuoteArg(dest) + L" ";
+    if (!noDest) cmd += QuoteArg(dest) + L" ";
     cmd += QuoteArg(L"@" + list);
 
     STARTUPINFOW si{};

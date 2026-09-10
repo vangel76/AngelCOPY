@@ -1,0 +1,4 @@
+// AngelCOPY application icon (white "AC" on orange). Icon id 1 — the first
+// icon in the file is also what Explorer shows for the exe. Linked into the
+// runner AND the agent; the tray loads it via LoadImage(id 1).
+1 ICON "..\\assets\\AngelCOPY.ico"

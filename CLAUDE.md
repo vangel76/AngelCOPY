@@ -96,7 +96,23 @@ build.bat                                             REM -> dist\*.dll, *.exe
     with a redirected pipe and parses output.
   - `ConflictUI.cpp` — pre-transfer conflict prompt (Replace / Only if newer /
     Skip / Cancel). `ConfirmUI.cpp` — the mandatory delete confirmation.
-  - `Delete.cpp` — own recursive deleter (no robocopy; see gotchas).
+  - `Delete.cpp` — own recursive deleter (no robocopy; see gotchas). Also
+    holds the parallel counters: `ScanDelete` (files/dirs/bytes, feeds the
+    delete prompt AND the properties dialog) and `ScanAllocated` (size on
+    disk), both on the shared `ScanWork`/`DrainScanWork` 8-worker queue.
+  - `PropsUI.cpp` — fast properties dialog (`props` op; Alt+Enter /
+    "Properties FAST"). Opens instantly, counts live via ScanDelete's
+    ScanProgress atomics (100 ms timer), size-on-disk only on button click
+    (`ScanAllocated`: extra round-trip per compressed/sparse file, cluster
+    rounding otherwise from find data — nearly free). "Windows properties…"
+    invokes the native sheet (verb `properties` / `SHMultiFileProperties`);
+    the sheet runs on a thread INSIDE the runner process, so `ShowProps`
+    keeps the process alive until every visible window is gone — exiting
+    earlier closes the sheet under the user's cursor. Single files are
+    deliberately NOT intercepted anywhere (native sheet is instant and
+    complete); the dialog rebuilds no tabs — Security/Sharing/Previous
+    Versions stay one click away behind the button, a full replacement would
+    be the Recycle-Bin lie again.
   - **Mirror ("Spiegeln"):** `sync` op = copy phase (Replace policy) then purge
     phase (delete destination entries not in the source). `ScanExtras`
     (Robocopy.cpp) finds the extras — top-level only, recurses solely where both
@@ -307,12 +323,23 @@ build.bat                                             REM -> dist\*.dll, *.exe
   - **Shift+Delete** is intercepted too -> runner `delete` (confirmation +
     parallel permanent delete) on the Explorer SELECTION. Same edit-focus
     passthrough; empty/virtual selection replays native Shift+Delete.
+  - **Alt+Enter** is intercepted too -> runner `props` (fast properties).
+    Arrives as WM_SYSKEYDOWN (Alt held). Empty selection = the CURRENT
+    folder (Explorer behavior); a single FILE replays native Alt+Enter on
+    purpose (nothing to count, the native sheet has all the tabs); virtual
+    folders/failure replay native. Same edit-focus passthrough and
+    key-repeat suppression (g_enterHeld).
   - Resolution via `GetActiveShellView(hwnd)` (IShellWindows -> match HWND ->
     IShellBrowser -> QueryActiveShellView). Folder: IFolderView ->
     IPersistFolder2 -> SIGDN_FILESYSPATH. Selection: IShellView::GetItemObject
     (SVGIO_SELECTION) -> CF_HDROP. `AngelCopyAgent.exe --test-resolve` writes
     every open window's folder AND selection to %TEMP%\acp_agent_test.txt —
     headless verification.
+  - **The tray icon is re-added on the `TaskbarCreated` broadcast.** Explorer
+    discards every tray icon when it rebuilds the taskbar — and the installer
+    restarts Explorer right after starting the agent, so without the re-add a
+    FRESH INSTALL showed no icon while the hooks worked (happened live, Sep
+    2026). Any tray app needs this; don't remove it.
   - Installer: autostarts via HKLM Run key, starts it post-install, kills it
     pre-install/uninstall (the exe is locked while running).
 - **Never invent a CLSID.** `{BB2E617C-...}` was used as "the stock drop handler"

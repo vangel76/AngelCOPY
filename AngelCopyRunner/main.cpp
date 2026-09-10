@@ -25,6 +25,7 @@
 #include "ConflictUI.h"
 #include "ConfirmUI.h"
 #include "Delete.h"
+#include "PropsUI.h"
 #include "../shared/Localize.h"
 
 #include <windows.h>
@@ -105,7 +106,8 @@ int Usage() {
     fwprintf(stderr,
              L"Usage: AngelCopyRunner [--console] <copy|move|sync> <destDir> "
              L"<src...|@listfile>\n"
-             L"       AngelCopyRunner [--console] delete <src...|@listfile>\n");
+             L"       AngelCopyRunner [--console] delete <src...|@listfile>\n"
+             L"       AngelCopyRunner [--console] props <src...|@listfile>\n");
     return 2;
 }
 
@@ -176,6 +178,25 @@ int wmain(int argc, wchar_t** argv) {
         if (!AskDeleteConfirm(scan)) return 0; // nothing touched
         int code = RunDeleteWithUI(targets, scan.bytes, scan.files);
         return (code >= 8) ? code : 0;
+    }
+
+    // ---- props: fast properties (count/size), read-only ----
+    if (_wcsicmp(argv[base], L"props") == 0) {
+        std::vector<std::wstring> targets;
+        if (!CollectSources(argc, argv, base + 1, targets)) return 3;
+        if (targets.empty()) {
+            fwprintf(stderr, L"[AngelCOPY] no items\n");
+            return 3;
+        }
+        if (consoleMode) {
+            DeleteScan scan = ScanDelete(targets);
+            unsigned long long alloc = ScanAllocated(targets);
+            wprintf(L"files=%llu dirs=%llu bytes=%llu alloc=%llu\n", scan.files,
+                    scan.dirs, scan.bytes, alloc);
+            return 0;
+        }
+        ShowProps(targets);
+        return 0;
     }
 
     // ---- copy / move ----

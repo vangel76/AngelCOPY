@@ -1,6 +1,16 @@
 ﻿ANGELCOPY — KURZANLEITUNG
 =========================
 
+WAS IST ANGELCOPY?
+  AngelCOPY ersetzt das langsame Kopieren, Verschieben und Löschen des
+  Windows Explorers durch eine eigene, parallele Engine — bei vielen
+  kleinen Dateien oft mehrfach schneller, Verschieben auf demselben
+  Laufwerk ist praktisch sofort fertig. Die Bedienung bleibt wie gewohnt:
+  Strg+C/V, Umschalt+Entf, Alt+Eingabe und das Kontextmenü — AngelCOPY
+  klinkt sich dort automatisch ein. Dazu kommen Spiegeln (Backup-Abgleich)
+  und ein schneller Eigenschaften-Dialog. Vor allem Riskantem (Löschen,
+  Spiegeln) wird IMMER zuerst gefragt.
+
 KOPIEREN & EINFÜGEN
   1. Dateien/Ordner wie gewohnt kopieren (Strg+C) oder ausschneiden (Strg+X).
   2. Im Zielordner einfügen:
@@ -22,6 +32,14 @@ SPIEGELN
 LÖSCHEN
   Auswahl → Rechtsklick „Löschen FAST" oder Umschalt+Entf.
   Endgültig, KEIN Papierkorb — es wird immer vorher gefragt.
+
+EIGENSCHAFTEN (SCHNELL)
+  Ordner oder Mehrfachauswahl → Alt+Eingabe oder Rechtsklick
+  „Eigenschaften FAST": Größe und Dateianzahl werden parallel gezählt —
+  deutlich schneller als das Windows-Dialog. „Belegt berechnen" liefert
+  die Größe auf dem Datenträger, „Windows-Eigenschaften…" öffnet das
+  Original (Sicherheit, Freigabe, …). Einzelne Dateien behalten das
+  normale Windows-Dialog.
 
 DER FORTSCHRITTSDIALOG
   • Grüne Abschnitte im Balken = übersprungen (am Ziel schon aktuell).
