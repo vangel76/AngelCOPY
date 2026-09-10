@@ -26,8 +26,7 @@ namespace angelcopy {
 // leaving the user staring at nothing for seconds.
 bool RunScanWithUI(ScanProgress& prog, const std::function<void()>& work);
 
-int RunJobsWithUI(Operation op, const std::wstring& destLabel,
-                  const std::vector<RoboJob>& jobs,
+int RunJobsWithUI(Operation op, const std::vector<RoboJob>& jobs,
                   unsigned long long expectedBytes,
                   unsigned long long expectedFiles, Conflict policy,
                   SkipInfo skipped,

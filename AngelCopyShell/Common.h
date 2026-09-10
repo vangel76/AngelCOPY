@@ -37,21 +37,16 @@ namespace angel {
 std::wstring ModuleDir();     // directory containing AngelCopyShell.dll
 std::wstring RunnerPath();    // <ModuleDir>\AngelCopyRunner.exe
 
-// Upper-case drive letter of a path, or 0 if it has none (UNC, etc.).
-wchar_t DriveLetter(const std::wstring& path);
-
-// Spawn AngelCopyRunner.exe: `op` is L"copy", L"move" or L"delete". `dest` is
-// ignored (and omitted from the command line) for delete. Sources are written
-// to a temp UTF-16LE list file (consumed+deleted by the runner) to dodge the
-// command-line length limit. Returns true if the process launched.
+// Spawn AngelCopyRunner.exe: `op` is L"copy", L"move", L"sync", L"delete" or
+// L"props". `dest` is ignored (and omitted from the command line) for
+// delete/props. Sources are written to a temp UTF-16LE list file
+// (consumed+deleted by the runner) to dodge the command-line length limit.
+// Returns true if the process launched.
 bool LaunchRunner(const wchar_t* op, const std::wstring& dest,
                   const std::vector<std::wstring>& sources);
 
 // ---- CF_HDROP / clipboard ----
 bool GetHDropPaths(IDataObject* pdo, std::vector<std::wstring>& out);
-DWORD GetPreferredDropEffect(IDataObject* pdo); // 0 if absent
-
-bool ClipboardHasHDrop();
 bool GetClipboardHDrop(std::vector<std::wstring>& out, DWORD& effect);
 
 } // namespace angel

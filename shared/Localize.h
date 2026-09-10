@@ -16,8 +16,8 @@ enum class S {
     // items lead with the verb too ("Hierher kopieren") — that is what the eye
     // scans. FAST also keeps us distinguishable from the native entry sitting
     // right below.
-    MenuCopyHere, MenuMoveHere, MenuPaste, MenuDelete,
-    HelpCopyHere, HelpMoveHere, HelpPaste, HelpDelete,
+    MenuCopyHere, MenuMoveHere, MenuDelete,
+    HelpCopyHere, HelpMoveHere, HelpDelete,
 
     // ---- progress dialog ----
     CapCopying, CapMoving, CapDeleting,
@@ -128,12 +128,10 @@ enum class S {
     PropsMultiName,    // count ("%llu items selected")
     PropsLineContent,  // files, nounFile, dirs, nounFolders
     PropsLineSize,     // human bytes, exact bytes
-    PropsLineAlloc,    // human bytes (or a dash before it is computed)
     PropsLineCreated,  // formatted datetime
     PropsLineModified, // formatted datetime
     PropsLineAttrs,    // comma-joined attribute words
     BtnWinProps,       // opens the native Windows properties dialog
-    BtnCalcAlloc,      // starts the size-on-disk walk
     AttrDirectory, AttrReadonly, AttrHidden, AttrSystem, AttrArchive,
     AttrCompressed,
 

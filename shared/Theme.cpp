@@ -13,7 +13,6 @@ namespace {
 const Colors kLight = {
     RGB(255, 255, 255), // bg
     RGB(  0,   0,   0), // text
-    RGB( 90,  90,  90), // textDim
     RGB(250, 250, 250), // chartBg
     RGB(220, 220, 220), // chartGrid
     RGB(204, 232, 255), // chartFill  (progress band, pale accent)
@@ -26,7 +25,6 @@ const Colors kLight = {
 const Colors kDark = {
     RGB( 32,  32,  32), // bg
     RGB(240, 240, 240), // text
-    RGB(170, 170, 170), // textDim
     RGB( 45,  45,  45), // chartBg
     RGB( 70,  70,  70), // chartGrid
     RGB( 45,  85, 115), // chartFill
@@ -76,9 +74,34 @@ HBRUSH BgBrush() {
 }
 
 void ApplyToWindow(HWND hwnd) {
+    // Title-bar app icon: the window classes carry no hIcon, so every dialog
+    // showed the generic document glyph. LR_SHARED: the system caches the
+    // icon, nothing to free.
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    HICON icoBig = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                     GetSystemMetrics(SM_CXICON),
+                                     GetSystemMetrics(SM_CYICON), LR_SHARED);
+    // Not named "small": rpcndr.h #defines small as char.
+    HICON icoSmall = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON),
+                                       GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    if (icoBig) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icoBig);
+    if (icoSmall) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icoSmall);
+
+    // Brand-orange caption so AngelCOPY windows are spottable at a glance.
+    // DWMWA_CAPTION_COLOR (35) / DWMWA_TEXT_COLOR (36) are Windows 11; the
+    // calls fail silently elsewhere. Same orange as the app icon (#EE7A1A),
+    // white caption text for contrast — in BOTH themes (that is the point).
+    COLORREF caption = RGB(238, 122, 26);
+    COLORREF captionText = RGB(255, 255, 255);
+    DwmSetWindowAttribute(hwnd, 35, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, 36, &captionText, sizeof(captionText));
+
     if (!IsDark()) return;
     // Dark title bar. Attribute 20 is the documented one (Windows 10 2004+);
     // 19 was the pre-release value on 1809..1909. Try both, ignore failure.
+    // (With the orange caption above this mainly keeps menus/frame remnants
+    // consistent on systems where 35 is unsupported.)
     BOOL dark = TRUE;
     if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark))))
         DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark));
@@ -126,5 +149,61 @@ void DrawButton(const DRAWITEMSTRUCT* dis, HFONT font) {
     DrawTextW(dis->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dis->hDC, of);
 }
+
+// ---- shared dialog boilerplate --------------------------------------------
+
+UiFonts::UiFonts() {
+    normal = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        normal = CreateFontIndirectW(&ncm.lfMessageFont);
+        LOGFONTW b = ncm.lfMessageFont;
+        b.lfWeight = FW_SEMIBOLD;
+        bold = CreateFontIndirectW(&b);
+    }
+    if (!bold) bold = normal;
+}
+
+UiFonts::~UiFonts() {
+    if (bold && bold != normal) DeleteObject(bold);
+    if (normal && normal != GetStockObject(DEFAULT_GUI_FONT))
+        DeleteObject(normal);
+}
+
+HWND CreateCenteredWindow(WNDPROC proc, const wchar_t* className,
+                          const wchar_t* caption, int cw, int ch, DWORD style,
+                          DWORD exStyle) {
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = proc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = BgBrush();
+    wc.lpszClassName = className;
+    RegisterClassW(&wc); // idempotent: re-registration fails harmlessly
+
+    // cw/ch are CLIENT dimensions; the window size must come from
+    // AdjustWindowRectEx (mixing the two once hid a Close button behind the
+    // report box — caption + borders are ~39px).
+    RECT rc{0, 0, cw, ch};
+    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+    int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+    return CreateWindowExW(exStyle, className, caption, style, sx, sy, W, H,
+                           nullptr, nullptr, hInst, nullptr);
+}
+
+void RunModalLoop(HWND hwnd) {
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+}
+
+void SetFont(HWND w, HFONT f) { SendMessageW(w, WM_SETFONT, (WPARAM)f, TRUE); }
 
 } // namespace theme

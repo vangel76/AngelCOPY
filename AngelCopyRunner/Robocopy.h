@@ -107,6 +107,14 @@ enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
 FileClass ClassifyFile(const std::wstring& dst, unsigned long long srcSize,
                        const FILETIME& srcTime, unsigned long long& dstSize);
 
+// THE policy predicate: does `policy` copy a file of class `fc`? The native
+// engine's per-file decision AND every aggregate (ExpectedFor, SkippedFor,
+// SkipSetFor, NeededSpaceFor's growth terms) derive from this one definition.
+// It used to live as five hand-mirrored switch tables kept aligned only by
+// comments — the drift-prone shape that produced the scan/engine divergence
+// bugs. Verified end-to-end by tests\test_conflict.cpp.
+bool PolicyCopies(Conflict policy, FileClass fc);
+
 // The exact set of (lowercased) source paths robocopy will list but NOT copy
 // under `policy` — same files always, plus the policy-excluded classes.
 std::unordered_set<std::wstring> SkipSetFor(const ScanResult& s, Conflict policy);
@@ -159,7 +167,14 @@ int RunJobs(Operation op, const std::vector<RoboJob>& jobs, Conflict policy);
 // user asked to keep — the same data-loss shape as the source-junction bug.
 void SetExcludedDirs(const std::vector<std::wstring>& names); // lowercased inside
 bool IsExcludedDir(const std::wstring& name);
+bool IsExcludedDir(const wchar_t* name); // alloc-free early-out for fd.cFileName
 bool AnyExcludedDirs();
+std::vector<std::wstring> ExcludedDirNames(); // the active set (lowercased)
+
+// Whether scans collect the per-file skip-path lists SkipSetFor consumes.
+// Only the robocopy fallback engine reads that set; main.cpp switches
+// collection off for native runs (default: on, for tests and fallback).
+void SetCollectSkipPaths(bool on);
 
 // The Unreal cache/derived folders the preset skips (proper case, for display
 // and for SetExcludedDirs).

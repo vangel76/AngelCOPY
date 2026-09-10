@@ -9,11 +9,9 @@ const wchar_t* kEn[] = {
     // menu
     L"Copy here FAST (AngelCOPY)",
     L"Move here FAST (AngelCOPY)",
-    L"Paste FAST (AngelCOPY)",
     L"Delete FAST (AngelCOPY)",
     L"Copy here with the AngelCOPY engine",
     L"Move here with the AngelCOPY engine",
-    L"Paste here with the AngelCOPY engine",
     L"Delete permanently (no Recycle Bin), asks first",
     // progress
     L"AngelCOPY \x2014 Copying",
@@ -117,12 +115,10 @@ const wchar_t* kEn[] = {
     L"%llu items selected",
     L"Contents: %llu %s, %llu %s",
     L"Size: %s (%llu bytes)",
-    L"On disk: %s",
     L"Created: %s",
     L"Modified: %s",
     L"Attributes: %s",
     L"Windows properties\x2026",
-    L"Compute size on disk",
     L"Directory", L"Read-only", L"Hidden", L"System", L"Archive",
     L"Compressed",
     // tray guide
@@ -133,11 +129,9 @@ const wchar_t* kDe[] = {
     // menu
     L"Hierher kopieren FAST (AngelCOPY)",
     L"Hierher verschieben FAST (AngelCOPY)",
-    L"Einfügen FAST (AngelCOPY)",
     L"Löschen FAST (AngelCOPY)",
     L"Hierher kopieren mit der AngelCOPY-Engine",
     L"Hierher verschieben mit der AngelCOPY-Engine",
-    L"Hier einfügen mit der AngelCOPY-Engine",
     L"Endgültig löschen (kein Papierkorb), fragt vorher",
     // progress
     L"AngelCOPY \x2014 Kopieren",
@@ -242,12 +236,10 @@ const wchar_t* kDe[] = {
     L"%llu Elemente ausgewählt",
     L"Inhalt: %llu %s, %llu %s",
     L"Größe: %s (%llu Bytes)",
-    L"Belegt: %s",
     L"Erstellt: %s",
     L"Geändert: %s",
     L"Attribute: %s",
     L"Windows-Eigenschaften\x2026",
-    L"Belegt berechnen",
     L"Verzeichnis", L"Schreibgeschützt", L"Versteckt", L"System", L"Archiv",
     L"Komprimiert",
     // tray guide

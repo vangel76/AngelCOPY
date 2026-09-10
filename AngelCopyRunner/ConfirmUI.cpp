@@ -1,6 +1,7 @@
 #include "ConfirmUI.h"
 #include "../shared/Localize.h"
 #include "../shared/Theme.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -57,17 +58,8 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void SetFont(HWND w, HFONT f) { SendMessageW(w, WM_SETFONT, (WPARAM)f, TRUE); }
-
-std::wstring HumanBytes(unsigned long long b) {
-    const wchar_t* u[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
-    double v = (double)b;
-    int i = 0;
-    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
-    wchar_t out[64];
-    StringCchPrintfW(out, 64, (v < 10 && i > 0) ? L"%.1f %s" : L"%.0f %s", v, u[i]);
-    return out;
-}
+using theme::SetFont;
+using acutil::HumanBytes;
 
 } // namespace
 
@@ -79,37 +71,17 @@ bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeByte
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = Proc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyLowSpace";
-    RegisterClassW(&wc);
-
     const int cw = 480, ch = 220;
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, cw, ch};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
-    int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
-                                loc::T(loc::S::SpaceCaption), kStyle,
-                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(Proc, L"AngelCopyLowSpace",
+                                            loc::T(loc::S::SpaceCaption), cw, ch,
+                                            kStyle, WS_EX_TOPMOST);
     if (!hwnd) return false;
 
+    theme::UiFonts fonts;
     State st;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     unsigned long long shortfall =
@@ -153,16 +125,7 @@ bool AskSpaceWarning(unsigned long long neededBytes, unsigned long long freeByte
     SetForegroundWindow(hwnd);
     SetFocus(bCancel);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    theme::RunModalLoop(hwnd);
     return st.confirmed;
 }
 
@@ -174,37 +137,17 @@ UnrealChoice AskUnrealPreset() {
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = Proc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyUnreal";
-    RegisterClassW(&wc);
-
     const int cw = 520, ch = 200;
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, cw, ch};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
-    int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
-                                loc::T(loc::S::UnrealCaption), kStyle,
-                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(Proc, L"AngelCopyUnreal",
+                                            loc::T(loc::S::UnrealCaption), cw,
+                                            ch, kStyle, WS_EX_TOPMOST);
     if (!hwnd) return {true, false}; // can't ask -> cancel (safe default)
 
+    theme::UiFonts fonts;
     State st;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     HWND lblHead = CreateWindowW(L"STATIC", loc::T(loc::S::UnrealHead),
@@ -242,16 +185,7 @@ UnrealChoice AskUnrealPreset() {
     SetForegroundWindow(hwnd);
     SetFocus(bGo);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    theme::RunModalLoop(hwnd);
     return {!st.confirmed, st.confirmed && st.chkChecked};
 }
 
@@ -263,36 +197,16 @@ bool AskSyncConfirm(unsigned long long copyFiles, unsigned long long copyBytes,
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = Proc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyConfirmSync";
-    RegisterClassW(&wc);
-
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, CW, CH};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
-    int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
-                                loc::T(loc::S::SyncCaption), kStyle,
-                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(Proc, L"AngelCopyConfirmSync",
+                                            loc::T(loc::S::SyncCaption), CW, CH,
+                                            kStyle, WS_EX_TOPMOST);
     if (!hwnd) return false;
 
+    theme::UiFonts fonts;
     State st;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     unsigned long long delItems = del.files + del.dirs;
@@ -352,16 +266,7 @@ bool AskSyncConfirm(unsigned long long copyFiles, unsigned long long copyBytes,
     SetForegroundWindow(hwnd);
     SetFocus(bCancel);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    theme::RunModalLoop(hwnd);
     return st.confirmed;
 }
 
@@ -370,36 +275,16 @@ bool AskDeleteConfirm(const DeleteScan& scan) {
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = Proc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyConfirmDelete";
-    RegisterClassW(&wc);
-
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, CW, CH};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
-    int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
-                                loc::T(loc::S::DeleteCaption), kStyle,
-                                sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(Proc, L"AngelCopyConfirmDelete",
+                                            loc::T(loc::S::DeleteCaption), CW,
+                                            CH, kStyle, WS_EX_TOPMOST);
     if (!hwnd) return false;
 
+    theme::UiFonts fonts;
     State st;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     wchar_t head[200];
@@ -443,16 +328,7 @@ bool AskDeleteConfirm(const DeleteScan& scan) {
     SetForegroundWindow(hwnd);
     SetFocus(bCancel);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    theme::RunModalLoop(hwnd);
     return st.confirmed;
 }
 

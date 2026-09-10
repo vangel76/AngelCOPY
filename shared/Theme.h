@@ -11,7 +11,6 @@ namespace theme {
 struct Colors {
     COLORREF bg;          // dialog background
     COLORREF text;        // primary text
-    COLORREF textDim;     // secondary text
     COLORREF chartBg;     // chart plot area
     COLORREF chartGrid;   // grid lines
     COLORREF chartFill;   // progress band (the "bar" half of the chart)
@@ -48,5 +47,32 @@ DWORD ButtonStyle(bool isDefault);
 
 // Paint an owner-drawn button. Only called when IsDark().
 void DrawButton(const DRAWITEMSTRUCT* dis, HFONT font);
+
+// ---- shared dialog boilerplate --------------------------------------------
+// Every dialog used to repeat the same ~35 lines of setup/teardown; these
+// four helpers replace them. Per-dialog WndProcs and layout stay untouched.
+
+// The message font + its semibold bold variant, with the stock-font fallback.
+// RAII: destroys what it created, never the stock object.
+struct UiFonts {
+    HFONT normal = nullptr;
+    HFONT bold = nullptr;
+    UiFonts();
+    ~UiFonts();
+    UiFonts(const UiFonts&) = delete;
+    UiFonts& operator=(const UiFonts&) = delete;
+};
+
+// Register `className` with `proc` and create a screen-centered window whose
+// CLIENT area is cw x ch (AdjustWindowRectEx — the client/window mixup gotcha
+// lives here once now). Returns null on failure.
+HWND CreateCenteredWindow(WNDPROC proc, const wchar_t* className,
+                          const wchar_t* caption, int cw, int ch, DWORD style,
+                          DWORD exStyle);
+
+// The modal GetMessage/IsDialogMessage loop every dialog runs.
+void RunModalLoop(HWND hwnd);
+
+void SetFont(HWND w, HFONT f);
 
 } // namespace theme

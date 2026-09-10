@@ -1,13 +1,11 @@
 #include "NativeCopy.h"
+#include "BatchQueue.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdio>
-#include <cwctype>
-#include <deque>
-#include <mutex>
 #include <thread>
 
 namespace angelcopy {
@@ -38,12 +36,8 @@ int PoolThreads() {
 }
 
 // \\?\ lifts MAX_PATH for the actual I/O calls. Paths arrive absolute from
-// the shell; UNC needs the \\?\UNC\ form.
-std::wstring ExtPath(const std::wstring& p) {
-    if (p.rfind(L"\\\\?\\", 0) == 0) return p;
-    if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
-    return L"\\\\?\\" + p;
-}
+// the shell; UNC needs the \\?\UNC\ form. Canonical: acutil::ExtLongPath.
+std::wstring ExtPath(const std::wstring& p) { return acutil::ExtLongPath(p); }
 
 // Create every missing component of `dir` (robocopy creates the full
 // destination path; the shell may hand us a target several levels deep).
@@ -72,19 +66,8 @@ std::wstring ParentOf(const std::wstring& p) {
     return cut == std::wstring::npos ? p : p.substr(0, cut);
 }
 
-std::wstring WinErrText(DWORD err) {
-    wchar_t* msg = nullptr;
-    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
-                                 FORMAT_MESSAGE_FROM_SYSTEM |
-                                 FORMAT_MESSAGE_IGNORE_INSERTS,
-                             nullptr, err, 0, (LPWSTR)&msg, 0, nullptr);
-    std::wstring out = (n && msg) ? std::wstring(msg, n) : L"";
-    if (msg) LocalFree(msg);
-    while (!out.empty() &&
-           (out.back() == L'\r' || out.back() == L'\n' || out.back() == L' '))
-        out.pop_back();
-    return out;
-}
+// Localized OS error text; canonical implementation in shared\Util.h.
+std::wstring WinErrText(DWORD err) { return acutil::WinErrText(err); }
 
 // Same language-neutral "(0xNNNNNNNN)" marker robocopy lines carried, so the
 // report box looks familiar; the text itself is the OS's own localized string.
@@ -99,15 +82,10 @@ bool Cancelled(const CopySink& sink) {
     return sink.cancelled && sink.cancelled();
 }
 
-// Which classes the policy leaves uncopied (Same is never copied).
+// The engine's per-file decision IS the shared predicate (Robocopy.h) — the
+// scan and the engine cannot drift apart when both read one definition.
 bool PolicySkips(Conflict policy, FileClass fc) {
-    switch (fc) {
-    case FileClass::Same:      return true;
-    case FileClass::Lonely:    return false;
-    case FileClass::DiffNewer: return policy == Conflict::Skip;
-    case FileClass::DiffOlder: return policy != Conflict::Replace;
-    }
-    return false;
+    return !PolicyCopies(policy, fc);
 }
 
 struct Item {
@@ -130,40 +108,8 @@ struct Plan {
     std::vector<std::wstring> srcDirsPostOrder;
 };
 
-// Bounded-by-nothing chunk queue between the walker and the copy pool. The
-// walk streams: the pool is already copying while later directories are still
-// being enumerated. (The first version walked the WHOLE tree before the first
-// byte moved — on a 500k-file folder the dialog sat at 0% for the entire
-// walk. Robocopy never had that pause; neither may we.)
-struct ChunkQueue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::vector<Item>> q;
-    bool closed = false;
-
-    void Push(std::vector<Item>&& c) {
-        {
-            std::lock_guard<std::mutex> l(m);
-            q.push_back(std::move(c));
-        }
-        cv.notify_one();
-    }
-    bool Pop(std::vector<Item>& out) {
-        std::unique_lock<std::mutex> l(m);
-        cv.wait(l, [&] { return closed || !q.empty(); });
-        if (q.empty()) return false;
-        out = std::move(q.front());
-        q.pop_front();
-        return true;
-    }
-    void Close() {
-        {
-            std::lock_guard<std::mutex> l(m);
-            closed = true;
-        }
-        cv.notify_all();
-    }
-};
+// Streaming walker->pool queue; see BatchQueue.h for why it streams.
+using ChunkQueue = BatchQueue<Item>;
 
 // Streaming walk mirroring ScanTree exactly (reparse points skipped — the old
 // /XJ — so outcomes match the scan's totals). Creates destination dirs on the
@@ -295,10 +241,13 @@ DWORD CALLBACK CopyProgress(LARGE_INTEGER /*total*/, LARGE_INTEGER transferred,
 bool CopyOneFile(const Item& it, const CopySink& sink) {
     ProgressCtx ctx{&sink};
     bool clearedRo = false;
+    // Prefix once: 16 workers rebuilding these on every retry iteration was
+    // pure allocator churn on the hottest path.
+    const std::wstring xs = ExtPath(it.src), xd = ExtPath(it.dst);
     for (int attempt = 0;; ++attempt) {
         BOOL cancelFlag = FALSE;
-        if (CopyFileExW(ExtPath(it.src).c_str(), ExtPath(it.dst).c_str(),
-                        CopyProgress, &ctx, &cancelFlag, 0)) {
+        if (CopyFileExW(xs.c_str(), xd.c_str(), CopyProgress, &ctx, &cancelFlag,
+                        0)) {
             if (ctx.reported < it.size && sink.onBytes)
                 sink.onBytes(it.size - ctx.reported); // tiny files see no callback delta
             return true;
@@ -306,10 +255,9 @@ bool CopyOneFile(const Item& it, const CopySink& sink) {
         DWORD err = GetLastError();
         if (err == ERROR_REQUEST_ABORTED) return false; // cancel: partial dst removed
         if (err == ERROR_ACCESS_DENIED && !clearedRo) {
-            DWORD a = GetFileAttributesW(ExtPath(it.dst).c_str());
+            DWORD a = GetFileAttributesW(xd.c_str());
             if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
-                SetFileAttributesW(ExtPath(it.dst).c_str(),
-                                   a & ~FILE_ATTRIBUTE_READONLY);
+                SetFileAttributesW(xd.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
                 clearedRo = true;
                 continue; // not a counted attempt
             }
@@ -323,11 +271,12 @@ bool CopyOneFile(const Item& it, const CopySink& sink) {
 }
 
 bool DeleteSourceFile(const std::wstring& src) {
-    if (DeleteFileW(ExtPath(src).c_str())) return true;
-    DWORD a = GetFileAttributesW(ExtPath(src).c_str());
+    const std::wstring xs = ExtPath(src);
+    if (DeleteFileW(xs.c_str())) return true;
+    DWORD a = GetFileAttributesW(xs.c_str());
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
-        SetFileAttributesW(ExtPath(src).c_str(), a & ~FILE_ATTRIBUTE_READONLY);
-        return DeleteFileW(ExtPath(src).c_str()) != 0;
+        SetFileAttributesW(xs.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
+        return DeleteFileW(xs.c_str()) != 0;
     }
     return false;
 }
@@ -377,12 +326,20 @@ DWORD RingCopyFile(const Item& it, const CopySink& sink) {
         unsigned long long off;
         DWORD len;
     };
+    // Ring buffers are reused across files: big files run strictly serially
+    // (ExecutePlan / the bigs loop), and a batch of just-over-32-MiB files
+    // paid an 8 x 8 MiB VirtualAlloc + zeroing per file for nothing. The
+    // buffers live until process exit (the runner is short-lived). Geometry
+    // (QD8 x 8 MiB) unchanged — this is allocation strategy, not tuning.
+    static unsigned char* ringBufs[kRingDepth]{};
     Op ops[kRingDepth]{};
-    for (auto& o : ops) {
-        o.buf = (unsigned char*)VirtualAlloc(nullptr, kRingChunk,
-                                             MEM_COMMIT | MEM_RESERVE,
-                                             PAGE_READWRITE);
-        if (!o.buf) fail = ERROR_NOT_ENOUGH_MEMORY;
+    for (int i = 0; i < kRingDepth; ++i) {
+        if (!ringBufs[i])
+            ringBufs[i] = (unsigned char*)VirtualAlloc(nullptr, kRingChunk,
+                                                       MEM_COMMIT | MEM_RESERVE,
+                                                       PAGE_READWRITE);
+        ops[i].buf = ringBufs[i];
+        if (!ops[i].buf) fail = ERROR_NOT_ENOUGH_MEMORY;
     }
 
     unsigned long long nextOff = 0;
@@ -450,17 +407,17 @@ DWORD RingCopyFile(const Item& it, const CopySink& sink) {
     CloseHandle(iocp);
     CloseHandle(hs);
     CloseHandle(hd);
-    for (auto& o : ops)
-        if (o.buf) VirtualFree(o.buf, 0, MEM_RELEASE);
+    // ringBufs stay allocated for the next big file (see above).
 
+    const std::wstring xd = ExtPath(it.dst);
     if (aborted || fail) {
-        DeleteFileW(ExtPath(it.dst).c_str()); // no partial leftovers
+        DeleteFileW(xd.c_str()); // no partial leftovers
         return aborted ? ERROR_REQUEST_ABORTED : fail;
     }
 
     // Trim the sector-rounded tail, stamp times (/COPY:T) and attributes
     // (/COPY:A) so the result matches what CopyFileEx would have produced.
-    HANDLE ht = CreateFileW(ExtPath(it.dst).c_str(), GENERIC_WRITE, 0, nullptr,
+    HANDLE ht = CreateFileW(xd.c_str(), GENERIC_WRITE, 0, nullptr,
                             OPEN_EXISTING, 0, nullptr);
     if (ht == INVALID_HANDLE_VALUE) return GetLastError();
     LARGE_INTEGER p;
@@ -470,8 +427,7 @@ DWORD RingCopyFile(const Item& it, const CopySink& sink) {
     SetFileTime(ht, &tCreate, &tAccess, &tWrite);
     CloseHandle(ht);
     DWORD a = GetFileAttributesW(ExtPath(it.src).c_str());
-    if (a != INVALID_FILE_ATTRIBUTES)
-        SetFileAttributesW(ExtPath(it.dst).c_str(), a);
+    if (a != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(xd.c_str(), a);
     return 0;
 }
 
@@ -518,9 +474,9 @@ bool CopyOneBig(const Item& it, const CopySink& sink) {
 // Same-volume: a rename, ~free. Cross-volume: ERROR_NOT_SAME_DEVICE — copy
 // then delete the source. The filesystem answers; no path heuristics.
 bool MoveOneFile(const Item& it, const CopySink& sink) {
+    const std::wstring xs = ExtPath(it.src), xd = ExtPath(it.dst);
     for (int pass = 0; pass < 2; ++pass) {
-        if (MoveFileExW(ExtPath(it.src).c_str(), ExtPath(it.dst).c_str(),
-                        MOVEFILE_REPLACE_EXISTING)) {
+        if (MoveFileExW(xs.c_str(), xd.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             if (sink.onBytes && it.size) sink.onBytes(it.size);
             return true;
         }
@@ -528,10 +484,9 @@ bool MoveOneFile(const Item& it, const CopySink& sink) {
         if (err == ERROR_NOT_SAME_DEVICE) break;
         if (err == ERROR_ACCESS_DENIED && pass == 0) {
             // read-only destination blocks the replace; clear it once
-            DWORD a = GetFileAttributesW(ExtPath(it.dst).c_str());
+            DWORD a = GetFileAttributesW(xd.c_str());
             if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
-                SetFileAttributesW(ExtPath(it.dst).c_str(),
-                                   a & ~FILE_ATTRIBUTE_READONLY);
+                SetFileAttributesW(xd.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
                 continue;
             }
         }
@@ -551,6 +506,9 @@ bool MoveOneFile(const Item& it, const CopySink& sink) {
 // entire tree moves in one metadata operation. Afterwards the moved tree is
 // walked (cheap) so the progress totals still add up.
 bool TryRenameTree(const RoboJob& job, const CopySink& sink) {
+    // Same guard as TryQuickRenameMove: a whole-tree rename cannot honor
+    // active directory exclusions — it would move the excluded caches along.
+    if (AnyExcludedDirs()) return false;
     if (GetFileAttributesW(ExtPath(job.dstDir).c_str()) != INVALID_FILE_ATTRIBUTES)
         return false;
     if (!MoveFileExW(ExtPath(job.srcDir).c_str(), ExtPath(job.dstDir).c_str(), 0))
@@ -777,6 +735,11 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
 
 bool TryQuickRenameMove(const RoboJob& job) {
     if (!job.files.empty()) return false; // whole-tree jobs only
+    // Exclusions active (Unreal preset): a whole-tree rename would move the
+    // excluded cache folders along — silently ignoring the choice the user
+    // just made in the prompt. Fall through to the per-file path, which is
+    // the only way to honor them.
+    if (AnyExcludedDirs()) return false;
     if (GetFileAttributesW(ExtPath(job.dstDir).c_str()) != INVALID_FILE_ATTRIBUTES)
         return false; // destination exists: conflicts possible, scan first
     CreateDirDeep(ParentOf(job.dstDir));

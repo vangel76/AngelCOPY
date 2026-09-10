@@ -2,6 +2,7 @@
 #include "Delete.h"
 #include "../shared/Localize.h"
 #include "../shared/Theme.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -25,16 +26,11 @@ namespace angelcopy {
 namespace {
 
 constexpr int ID_WINPROPS = 1201;
-constexpr int ID_CALCALLOC = 1202;
 constexpr UINT_PTR TIMER_REFRESH = 1; // branch on the id (WM_TIMER gotcha)
 constexpr int CW = 460;
-constexpr int CH = 284;
+constexpr int CH = 252;
 
-std::wstring ExtP(const std::wstring& p) {
-    if (p.rfind(L"\\\\?\\", 0) == 0) return p;
-    if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
-    return L"\\\\?\\" + p;
-}
+std::wstring ExtP(const std::wstring& p) { return acutil::ExtLongPath(p); }
 
 std::wstring BaseNameOf(const std::wstring& p) {
     std::wstring s = p;
@@ -43,15 +39,7 @@ std::wstring BaseNameOf(const std::wstring& p) {
     return (i == std::wstring::npos) ? s : s.substr(i + 1);
 }
 
-std::wstring HumanBytes(unsigned long long b) {
-    const wchar_t* u[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
-    double v = (double)b;
-    int i = 0;
-    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
-    wchar_t out[64];
-    StringCchPrintfW(out, 64, (v < 10 && i > 0) ? L"%.1f %s" : L"%.0f %s", v, u[i]);
-    return out;
-}
+using acutil::HumanBytes2; // always 2 decimals: "11 TB" hides ~250 GB
 
 // Locale-formatted local date + time for a UTC FILETIME.
 std::wstring FormatWhen(const FILETIME& ftUtc) {
@@ -123,16 +111,13 @@ void OpenNativeProps(const std::vector<std::wstring>& targets) {
 
 struct PState {
     std::vector<std::wstring> targets;
-    ScanProgress countProg, allocProg;
+    ScanProgress countProg;
     DeleteScan result;                 // exact totals once countDone
     std::atomic<bool> countDone{false};
-    std::atomic<bool> allocRunning{false}, allocDone{false};
-    unsigned long long allocTotal = 0; // valid once allocDone
-    std::thread countThread, allocThread;
+    std::thread countThread;
     bool nativeOpened = false;
 
-    HWND lblContent = nullptr, lblSize = nullptr, lblAlloc = nullptr;
-    HWND btnAlloc = nullptr;
+    HWND lblContent = nullptr, lblSize = nullptr;
     HFONT font = nullptr, fontBold = nullptr;
 };
 
@@ -155,22 +140,9 @@ void RefreshCounts(PState* st) {
     SetWindowTextW(st->lblContent, line);
 
     StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineSize),
-                     HumanBytes(bytes).c_str(), bytes);
+                     HumanBytes2(bytes).c_str(), bytes);
     if (!done) StringCchCatW(line, 256, L" \x2026");
     SetWindowTextW(st->lblSize, line);
-
-    if (st->allocDone.load(std::memory_order_acquire)) {
-        StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineAlloc),
-                         HumanBytes(st->allocTotal).c_str());
-        SetWindowTextW(st->lblAlloc, line);
-    } else if (st->allocRunning.load(std::memory_order_relaxed)) {
-        unsigned long long a =
-            st->allocProg.bytes.load(std::memory_order_relaxed);
-        StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineAlloc),
-                         HumanBytes(a).c_str());
-        StringCchCatW(line, 256, L" \x2026");
-        SetWindowTextW(st->lblAlloc, line);
-    }
 }
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -193,16 +165,6 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OpenNativeProps(st->targets);
             return 0;
         }
-        if (LOWORD(wp) == ID_CALCALLOC) {
-            if (!st->allocRunning.exchange(true)) {
-                EnableWindow(st->btnAlloc, FALSE);
-                st->allocThread = std::thread([st] {
-                    st->allocTotal = ScanAllocated(st->targets, &st->allocProg);
-                    st->allocDone.store(true, std::memory_order_release);
-                });
-            }
-            return 0;
-        }
         if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
         break;
     case WM_CLOSE:
@@ -216,7 +178,7 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void SetFont(HWND w, HFONT f) { SendMessageW(w, WM_SETFONT, (WPARAM)f, TRUE); }
+using theme::SetFont;
 
 } // namespace
 
@@ -229,41 +191,21 @@ void ShowProps(const std::vector<std::wstring>& targets) {
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = Proc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyProps";
-    RegisterClassW(&wc);
-
     // NOT topmost: the native sheet the button opens must be able to cover us.
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, CW, CH};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, 0);
-    int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, loc::T(loc::S::PropsCaption),
-                                kStyle, sx, sy, W, H, nullptr, nullptr, hInst,
-                                nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(Proc, L"AngelCopyProps",
+                                            loc::T(loc::S::PropsCaption), CW, CH,
+                                            kStyle, 0);
     if (!hwnd) {
         if (SUCCEEDED(comInit)) CoUninitialize();
         return;
     }
 
+    theme::UiFonts fonts;
     PState st;
     st.targets = targets;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     // Header: name + path (single target), "N items selected" + parent (multi).
@@ -294,16 +236,6 @@ void ShowProps(const std::vector<std::wstring>& targets) {
     st.lblSize = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16, 92,
                                CW - 32, 20, hwnd, nullptr, hInst, nullptr);
 
-    wchar_t allocInit[64];
-    StringCchPrintfW(allocInit, 64, loc::T(loc::S::PropsLineAlloc), L"\x2014");
-    st.lblAlloc = CreateWindowW(L"STATIC", allocInit, WS_CHILD | WS_VISIBLE, 16,
-                                116, CW - 32 - 166, 20, hwnd, nullptr, hInst,
-                                nullptr);
-    st.btnAlloc = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnCalcAlloc),
-                                WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false),
-                                CW - 16 - 150, 111, 150, 26, hwnd,
-                                (HMENU)(INT_PTR)ID_CALCALLOC, hInst, nullptr);
-
     // Timestamps + attributes: single target only (an aggregate would lie).
     HWND lblCreated = nullptr, lblModified = nullptr, lblAttrs = nullptr;
     if (single) {
@@ -315,22 +247,22 @@ void ShowProps(const std::vector<std::wstring>& targets) {
             StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineCreated),
                              FormatWhen(fa.ftCreationTime).c_str());
             lblCreated = CreateWindowW(L"STATIC", line, WS_CHILD | WS_VISIBLE,
-                                       16, 148, CW - 32, 20, hwnd, nullptr,
+                                       16, 116, CW - 32, 20, hwnd, nullptr,
                                        hInst, nullptr);
             StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineModified),
                              FormatWhen(fa.ftLastWriteTime).c_str());
             lblModified = CreateWindowW(L"STATIC", line, WS_CHILD | WS_VISIBLE,
-                                        16, 172, CW - 32, 20, hwnd, nullptr,
+                                        16, 140, CW - 32, 20, hwnd, nullptr,
                                         hInst, nullptr);
             StringCchPrintfW(line, 256, loc::T(loc::S::PropsLineAttrs),
                              AttrWords(fa.dwFileAttributes).c_str());
             lblAttrs = CreateWindowW(L"STATIC", line, WS_CHILD | WS_VISIBLE, 16,
-                                     196, CW - 32, 20, hwnd, nullptr, hInst,
+                                     164, CW - 32, 20, hwnd, nullptr, hInst,
                                      nullptr);
         }
     }
 
-    const int by = 236, bh = 30;
+    const int by = 204, bh = 30;
     HWND btnWin = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnWinProps),
                                 WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false),
                                 16, by, 190, bh, hwnd,
@@ -344,15 +276,13 @@ void ShowProps(const std::vector<std::wstring>& targets) {
     SetFont(lblPath, st.font);
     SetFont(st.lblContent, st.font);
     SetFont(st.lblSize, st.font);
-    SetFont(st.lblAlloc, st.font);
     for (HWND w : {lblCreated, lblModified, lblAttrs})
         if (w) SetFont(w, st.font);
-    SetFont(st.btnAlloc, st.font);
     SetFont(btnWin, st.font);
     SetFont(btnClose, st.font);
 
     theme::ApplyToWindow(hwnd);
-    for (HWND b : {st.btnAlloc, btnWin, btnClose}) theme::ApplyToControl(b);
+    for (HWND b : {btnWin, btnClose}) theme::ApplyToControl(b);
 
     // The counter starts immediately; the dialog is already visible while it
     // runs (that is the whole point vs. Explorer's dialog).
@@ -369,19 +299,11 @@ void ShowProps(const std::vector<std::wstring>& targets) {
     SetForegroundWindow(hwnd);
     SetFocus(btnClose);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
+    theme::RunModalLoop(hwnd);
 
-    // Closing cancels any still-running walk; both exit promptly.
+    // Closing cancels a still-running count; it exits promptly.
     st.countProg.cancel.store(1, std::memory_order_relaxed);
-    st.allocProg.cancel.store(1, std::memory_order_relaxed);
     if (st.countThread.joinable()) st.countThread.join();
-    if (st.allocThread.joinable()) st.allocThread.join();
 
     // The native properties sheet lives on a thread INSIDE this process —
     // exiting now would close it under the user's cursor. Wait until every
@@ -406,9 +328,6 @@ void ShowProps(const std::vector<std::wstring>& targets) {
         }
     }
 
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT))
-        DeleteObject(st.font);
     if (SUCCEEDED(comInit)) CoUninitialize();
 }
 

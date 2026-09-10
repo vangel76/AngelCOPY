@@ -27,7 +27,6 @@ constexpr int CH = 334;
 struct DlgState {
     Conflict choice = Conflict::Replace;
     bool cancelled = true;   // closing the window == cancel
-    bool decided = false;
     HFONT font = nullptr, fontBold = nullptr;
 };
 
@@ -45,10 +44,10 @@ LRESULT CALLBACK ConflictProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (!st) break;
         switch (LOWORD(wp)) {
-        case ID_REPLACE: st->choice = Conflict::Replace;        st->cancelled = false; st->decided = true; DestroyWindow(hwnd); return 0;
-        case ID_SKIP:    st->choice = Conflict::Skip;           st->cancelled = false; st->decided = true; DestroyWindow(hwnd); return 0;
-        case ID_NEWER:   st->choice = Conflict::ReplaceIfNewer; st->cancelled = false; st->decided = true; DestroyWindow(hwnd); return 0;
-        case ID_CANCEL:  st->cancelled = true; st->decided = true; DestroyWindow(hwnd); return 0;
+        case ID_REPLACE: st->choice = Conflict::Replace;        st->cancelled = false; DestroyWindow(hwnd); return 0;
+        case ID_SKIP:    st->choice = Conflict::Skip;           st->cancelled = false; DestroyWindow(hwnd); return 0;
+        case ID_NEWER:   st->choice = Conflict::ReplaceIfNewer; st->cancelled = false; DestroyWindow(hwnd); return 0;
+        case ID_CANCEL:  st->cancelled = true; DestroyWindow(hwnd); return 0;
         }
         break;
     case WM_CLOSE:
@@ -61,7 +60,7 @@ LRESULT CALLBACK ConflictProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void SetFont(HWND w, HFONT f) { SendMessageW(w, WM_SETFONT, (WPARAM)f, TRUE); }
+using theme::SetFont;
 
 } // namespace
 
@@ -71,36 +70,16 @@ Conflict AskConflict(Operation op, unsigned long long conflictCount,
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = ConflictProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = theme::BgBrush();
-    wc.lpszClassName = L"AngelCopyConflict";
-    RegisterClassW(&wc);
-
     const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT rc{0, 0, CW, CH};
-    AdjustWindowRectEx(&rc, kStyle, FALSE, WS_EX_TOPMOST);
-    const int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
-
-    HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST, wc.lpszClassName, loc::T(loc::S::ConflictCaption), kStyle,
-        sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = theme::CreateCenteredWindow(ConflictProc, L"AngelCopyConflict",
+                                            loc::T(loc::S::ConflictCaption), CW,
+                                            CH, kStyle, WS_EX_TOPMOST);
     if (!hwnd) { cancelled = false; return Conflict::Replace; }
 
+    theme::UiFonts fonts;
     DlgState st;
-    st.font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        st.font = CreateFontIndirectW(&ncm.lfMessageFont);
-        LOGFONTW b = ncm.lfMessageFont;
-        b.lfWeight = FW_SEMIBOLD;
-        st.fontBold = CreateFontIndirectW(&b);
-    }
-    if (!st.fontBold) st.fontBold = st.font;
+    st.font = fonts.normal;
+    st.fontBold = fonts.bold;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&st);
 
     wchar_t head[200];
@@ -162,16 +141,7 @@ Conflict AskConflict(Operation op, unsigned long long conflictCount,
     SetForegroundWindow(hwnd);
     SetFocus(bNewer);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessageW(hwnd, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (st.fontBold && st.fontBold != st.font) DeleteObject(st.fontBold);
-    if (st.font && st.font != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(st.font);
+    theme::RunModalLoop(hwnd);
 
     cancelled = st.cancelled;
     return st.choice;

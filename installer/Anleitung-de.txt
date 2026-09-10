@@ -36,10 +36,9 @@ LÖSCHEN
 EIGENSCHAFTEN (SCHNELL)
   Ordner oder Mehrfachauswahl → Alt+Eingabe oder Rechtsklick
   „Eigenschaften FAST": Größe und Dateianzahl werden parallel gezählt —
-  deutlich schneller als das Windows-Dialog. „Belegt berechnen" liefert
-  die Größe auf dem Datenträger, „Windows-Eigenschaften…" öffnet das
-  Original (Sicherheit, Freigabe, …). Einzelne Dateien behalten das
-  normale Windows-Dialog.
+  deutlich schneller als das Windows-Dialog. „Windows-Eigenschaften…"
+  öffnet das Original (Sicherheit, Freigabe, …). Einzelne Dateien
+  behalten das normale Windows-Dialog.
 
 DER FORTSCHRITTSDIALOG
   • Grüne Abschnitte im Balken = übersprungen (am Ziel schon aktuell).
@@ -54,3 +53,5 @@ WINDOWS 11
 
 Diese Anleitung jederzeit: Startmenü → AngelCOPY → „AngelCOPY Anleitung"
 (oder in der Windows-Suche „AngelCOPY Anleitung" tippen)
+
+AngelCOPY — © Valentin Klein

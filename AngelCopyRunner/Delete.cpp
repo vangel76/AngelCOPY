@@ -1,10 +1,9 @@
 #include "Delete.h"
+#include "BatchQueue.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <atomic>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -18,13 +17,8 @@ std::wstring StripSep(std::wstring p) {
 }
 
 // \\?\ form so paths longer than MAX_PATH work. Explorer refuses those; we
-// should not inherit that limit when deleting.
-std::wstring Ext(const std::wstring& p) {
-    if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) return p;
-    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\')
-        return L"\\\\?\\UNC\\" + p.substr(2);   // \\server\share -> \\?\UNC\server\share
-    return L"\\\\?\\" + p;
-}
+// should not inherit that limit when deleting. Canonical: acutil::ExtLongPath.
+std::wstring Ext(const std::wstring& p) { return acutil::ExtLongPath(p); }
 
 std::wstring BaseName(const std::wstring& p) {
     std::wstring s = StripSep(p);
@@ -32,17 +26,8 @@ std::wstring BaseName(const std::wstring& p) {
     return (i == std::wstring::npos) ? s : s.substr(i + 1);
 }
 
-std::wstring SysError(DWORD e) {
-    LPWSTR buf = nullptr;
-    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
-                                 FORMAT_MESSAGE_FROM_SYSTEM |
-                                 FORMAT_MESSAGE_IGNORE_INSERTS,
-                             nullptr, e, 0, (LPWSTR)&buf, 0, nullptr);
-    std::wstring s = (n && buf) ? buf : L"";
-    if (buf) LocalFree(buf);
-    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back();
-    return s;
-}
+// Localized OS error text; canonical implementation in shared\Util.h.
+std::wstring SysError(DWORD e) { return acutil::WinErrText(e); }
 
 void ReportError(const DeleteSink& sink, const std::wstring& path, DWORD e) {
     if (sink.onError)
@@ -108,35 +93,7 @@ struct DelItem {
     unsigned long long size;
 };
 
-struct DelQueue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::vector<DelItem>> q;
-    bool closed = false;
-
-    void Push(std::vector<DelItem>&& c) {
-        {
-            std::lock_guard<std::mutex> l(m);
-            q.push_back(std::move(c));
-        }
-        cv.notify_one();
-    }
-    bool Pop(std::vector<DelItem>& out) {
-        std::unique_lock<std::mutex> l(m);
-        cv.wait(l, [&] { return closed || !q.empty(); });
-        if (q.empty()) return false;
-        out = std::move(q.front());
-        q.pop_front();
-        return true;
-    }
-    void Close() {
-        {
-            std::lock_guard<std::mutex> l(m);
-            closed = true;
-        }
-        cv.notify_all();
-    }
-};
+using DelQueue = BatchQueue<DelItem>;
 
 // Streaming walk: enqueues one directory's files per chunk while the pool is
 // already deleting earlier directories. Junctions/symlinks are removed as
@@ -242,7 +199,6 @@ struct ScanWork {
     struct Entry {
         std::wstring dir;
         int depth = 0;
-        unsigned long long cluster = 0; // ScanAllocated only; 0 for the count
     };
     std::mutex m;
     std::condition_variable cv;
@@ -250,10 +206,10 @@ struct ScanWork {
     int active = 0;   // directories currently being enumerated
     bool done = false;
 
-    void Push(std::wstring dir, int depth, unsigned long long cluster = 0) {
+    void Push(std::wstring dir, int depth) {
         {
             std::lock_guard<std::mutex> l(m);
-            q.push_back(Entry{std::move(dir), depth, cluster});
+            q.push_back(Entry{std::move(dir), depth});
         }
         cv.notify_one();
     }
@@ -339,7 +295,7 @@ DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
             s.dirs += 1;
             if (prog) prog->dirs.fetch_add(1, std::memory_order_relaxed);
             if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT))
-                work.q.push_back(ScanWork::Entry{t, 0, 0}); // pre-pool: no lock yet
+                work.q.push_back(ScanWork::Entry{t, 0}); // pre-pool: no lock yet
         } else {
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             if (GetFileAttributesExW(Ext(t).c_str(), GetFileExInfoStandard, &fa)) {
@@ -366,103 +322,6 @@ DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
         s.bytes += l.bytes;
     }
     return s;
-}
-
-// ---- size on disk ----------------------------------------------------------
-// What Explorer's "Size on disk" shows: the true allocation for compressed and
-// sparse files (GetCompressedFileSize — the only case needing an extra
-// round-trip), and the find-data size rounded UP to the volume's cluster for
-// ordinary files. Runs on the same 8-worker directory queue as the count.
-
-unsigned long long ClusterOf(const std::wstring& path) {
-    std::wstring root;
-    if (path.size() >= 2 && path[1] == L':') {
-        root = path.substr(0, 2) + L"\\";
-    } else if (path.rfind(L"\\\\", 0) == 0) {
-        size_t s1 = path.find(L'\\', 2);
-        size_t s2 = (s1 == std::wstring::npos) ? s1 : path.find(L'\\', s1 + 1);
-        root = (s2 == std::wstring::npos) ? path + L"\\" : path.substr(0, s2 + 1);
-    }
-    DWORD spc = 0, bps = 0, fc = 0, tc = 0;
-    if (!root.empty() &&
-        GetDiskFreeSpaceW(root.c_str(), &spc, &bps, &fc, &tc) && spc && bps)
-        return (unsigned long long)spc * bps;
-    return 4096; // can't tell (odd share): the common NTFS default
-}
-
-unsigned long long AllocOfFile(const std::wstring& path, DWORD attr,
-                               unsigned long long fdSize,
-                               unsigned long long cluster) {
-    if (attr & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE)) {
-        ULARGE_INTEGER v{};
-        v.LowPart = GetCompressedFileSizeW(Ext(path).c_str(), &v.HighPart);
-        if (v.LowPart == INVALID_FILE_SIZE && GetLastError() != NO_ERROR)
-            return 0; // vanished/unreadable: count nothing rather than lie
-        return v.QuadPart; // already the true allocation
-    }
-    return ((fdSize + cluster - 1) / cluster) * cluster;
-}
-
-void AllocOneDir(const ScanWork::Entry& e, unsigned long long& acc,
-                 ScanWork& work, ScanProgress* prog) {
-    if (e.depth >= kMaxDepth) return;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW((Ext(e.dir) + L"\\*").c_str(), FindExInfoBasic,
-                                &fd, FindExSearchNameMatch, nullptr, 0);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
-            continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-                work.Push(e.dir + L"\\" + fd.cFileName, e.depth + 1, e.cluster);
-        } else {
-            unsigned long long sz =
-                ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            unsigned long long a = AllocOfFile(e.dir + L"\\" + fd.cFileName,
-                                               fd.dwFileAttributes, sz, e.cluster);
-            acc += a;
-            if (prog) prog->bytes.fetch_add(a, std::memory_order_relaxed);
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-}
-
-unsigned long long ScanAllocated(const std::vector<std::wstring>& targets,
-                                 ScanProgress* prog) {
-    unsigned long long total = 0;
-    ScanWork work;
-    for (const auto& raw : targets) {
-        if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
-        std::wstring t = StripSep(raw);
-        if (t.empty()) continue;
-        DWORD attr = GetFileAttributesW(Ext(t).c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES) continue;
-        unsigned long long cluster = ClusterOf(t);
-        if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT))
-                work.q.push_back(ScanWork::Entry{t, 0, cluster});
-        } else {
-            WIN32_FILE_ATTRIBUTE_DATA fa{};
-            if (GetFileAttributesExW(Ext(t).c_str(), GetFileExInfoStandard, &fa)) {
-                unsigned long long sz =
-                    ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-                unsigned long long a =
-                    AllocOfFile(t, fa.dwFileAttributes, sz, cluster);
-                total += a;
-                if (prog) prog->bytes.fetch_add(a, std::memory_order_relaxed);
-            }
-        }
-    }
-    if (work.q.empty()) return total;
-
-    std::vector<unsigned long long> local(kDelThreads, 0);
-    DrainScanWork(work, prog, [&](const ScanWork::Entry& e, int t) {
-        AllocOneDir(e, local[t], work, prog);
-    });
-    for (unsigned long long l : local) total += l;
-    return total;
 }
 
 int DeleteTargets(const std::vector<std::wstring>& targets, const DeleteSink& sink) {

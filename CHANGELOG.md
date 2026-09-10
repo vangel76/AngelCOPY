@@ -4,6 +4,94 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-09-10
+
+### Removed
+- **"Compute size on disk" button** in the fast properties dialog, on
+  request — the on-disk figure added nothing over the plain size. The
+  dialog is a row shorter; `--console props` prints files/dirs/bytes only.
+
+### Changed
+- **The classic-menu choice is now two clickable pictures:** the installer's
+  task page shows both menus side by side (default Windows 11 with AngelCOPY
+  hidden behind "Show more options" vs classic with the entries directly
+  visible), titled "Unchecked: default" / "Checked: classic" in the wizard's
+  language. Clicking a picture selects that option, the selected one carries
+  an orange frame, and the checkbox and frames stay in sync both ways.
+  The page opens preselected to what Windows is actually set to, and the
+  choice now works in BOTH directions: picking the default Windows 11 menu
+  removes the classic-menu key even if it was set long before the install
+  (previously deselecting silently changed nothing).
+- **AngelCOPY dialogs are instantly recognizable:** the title bar is now
+  brand-orange with white text (Windows 11 caption coloring; both themes) and
+  carries the AC icon — previously every dialog showed the broken generic
+  document glyph (the window classes had no icon set).
+- **Properties size always shows two decimals** ("11.23 TB" instead of
+  "11 TB", which hid ~250 GB of rounding). Exact byte count stays in
+  parentheses; other dialogs keep the compact format.
+
+### Added
+- **The installer restores your Explorer windows.** Installing has to close
+  Explorer (it locks the shell DLL); setup now remembers every open Explorer
+  window's folder beforehand (via `Shell.Application`, virtual locations like
+  This PC included), tells you what will happen ("your N windows will be
+  reopened"), and reopens them all when the installation finishes. Strictly
+  fail-open: if the enumeration fails, the install proceeds as before.
+
+### Fixed
+- **A move of an Unreal project with "skip caches" checked no longer moves
+  the caches anyway.** Both whole-tree rename fast paths (`TryQuickRenameMove`,
+  `TryRenameTree`) renamed the entire tree — caches included — silently
+  ignoring the checkbox; with exclusions active they now fall through to the
+  per-file path, the only one that can honor them.
+- **The scan pool could degenerate to one worker on a flat directory.** The
+  parallel destination classification pushed one batch per directory with no
+  size cap; a flat 100k-file folder landed on ONE of the 8 workers while the
+  other 7 idled. Batches now split at 256 files, like the copy and delete
+  pools always did.
+
+### Changed
+- **Codebase-wide simplification pass** (4-angle review: reuse,
+  simplification, efficiency, altitude). No behavior change beyond the two
+  fixes above; all test suites pass, both engines smoke-tested.
+  - One canonical `\\?\` long-path helper (`shared\Util.h`,
+    `acutil::ExtLongPath`) replaces five independent copies — one of which
+    had already drifted (the agent's lacked the already-prefixed check).
+    `HumanBytes` (3 copies), `LowerCopy` (2), the FormatMessage error-text
+    helper (2, drifted trim) consolidated the same way.
+  - One `BatchQueue<T>` template replaces the three byte-identical
+    producer→pool queues in the copy walk, scan and deleter.
+  - The hostile-HGLOBAL guards in the shell DLL (undersized CF_HDROP /
+    effect blocks) now live in exactly one place each.
+  - Dead code removed: three never-called shell helpers, two orphaned
+    Localize strings, an unused dialog member, unused struct fields, dead
+    locals, a leftover ICC_PROGRESS_CLASS init.
+  - Native runs no longer collect per-file skip-path lists the robocopy
+    fallback alone consumes (~1M string allocations pinned per 500k-file
+    re-mirror); the fallback still gets them.
+  - Hot-path efficiency: `\\?\` prefixes computed once per file instead of
+    2-6×; the big-file ring reuses its 64 MiB of buffers across files
+    instead of re-allocating per file; the fresh-destination scan fast path
+    builds no per-file path strings; exclusion checks no longer allocate
+    when no exclusions are set (the common case).
+  - Robocopy `/XD` now emits the actual exclusion set, not the Unreal
+    constant, so the fallback cannot diverge from the native walks.
+  - **One policy predicate.** Which file classes a conflict policy copies was
+    encoded in five hand-mirrored switch tables (engine + four scan
+    aggregates), kept aligned only by comments; now all derive from a single
+    `PolicyCopies` — the drift-prone shape behind earlier scan/engine
+    divergence bugs is gone. Verified by the conflict test suite.
+  - **Dialog boilerplate consolidated** (~250 lines): font pair, centered
+    window creation and the modal loop now live once in `shared\Theme`; all
+    eight dialogs use them. Layouts unchanged, both themes
+    screenshot-verified.
+  - **Progress counters are lock-free** (atomics; the critical section now
+    guards only the current-file string, errors and the IO-counter handle,
+    and the current-file label updates at most every 50 ms instead of per
+    file). Measured honestly: no wall-clock change (6964 vs 6957 ms median
+    on a 30k-file copy) — the lock was never the bottleneck; kept for the
+    clearer ownership and the saved per-file string copies.
+
 ## [1.4.0] — 2026-09-10
 
 ### Added
@@ -37,7 +125,7 @@ project aims to follow [Semantic Versioning](https://semver.org/).
   clicks away, alongside the existing Start-menu shortcut and the
   post-install page.
 
-## [Unreleased]
+## [1.3.2] — 2026-08-27
 
 ### Fixed
 - **Ctrl+V / Shift+Del silently reverting to native after long uptime.**

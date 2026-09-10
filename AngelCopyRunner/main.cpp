@@ -29,7 +29,6 @@
 #include "../shared/Localize.h"
 
 #include <windows.h>
-#include <conio.h>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -127,6 +126,23 @@ bool CollectSources(int argc, wchar_t** argv, int first,
     return true;
 }
 
+// Collect + reject an empty set — every op needs at least one item.
+bool CollectOrFail(int argc, wchar_t** argv, int first,
+                   std::vector<std::wstring>& sources) {
+    if (!CollectSources(argc, argv, first, sources)) return false;
+    if (sources.empty()) {
+        fwprintf(stderr, L"[AngelCOPY] no items\n");
+        return false;
+    }
+    return true;
+}
+
+// THE console-mode opt-in for anything irreversible (delete, mirror purge):
+// headless runs cannot prompt, so they must not destroy without this.
+bool ConsoleDeleteOptIn() {
+    return GetEnvironmentVariableW(L"ANGELCOPY_CONFIRM_DELETE", nullptr, 0) != 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -142,17 +158,13 @@ int wmain(int argc, wchar_t** argv) {
     // ---- delete: no destination argument ----
     if (_wcsicmp(argv[base], L"delete") == 0) {
         std::vector<std::wstring> targets;
-        if (!CollectSources(argc, argv, base + 1, targets)) return 3;
-        if (targets.empty()) {
-            fwprintf(stderr, L"[AngelCOPY] no items to delete\n");
-            return 3;
-        }
+        if (!CollectOrFail(argc, argv, base + 1, targets)) return 3;
 
         if (consoleMode) {
             DeleteScan scan = ScanDelete(targets);
             // Headless: no prompt is possible, and this is irreversible — so
             // require an explicit opt-in rather than silently deleting.
-            if (GetEnvironmentVariableW(L"ANGELCOPY_CONFIRM_DELETE", nullptr, 0) == 0) {
+            if (!ConsoleDeleteOptIn()) {
                 fwprintf(stderr,
                          L"[AngelCOPY] refusing to delete %llu files without a "
                          L"prompt.\n           Set ANGELCOPY_CONFIRM_DELETE=1 to "
@@ -183,16 +195,11 @@ int wmain(int argc, wchar_t** argv) {
     // ---- props: fast properties (count/size), read-only ----
     if (_wcsicmp(argv[base], L"props") == 0) {
         std::vector<std::wstring> targets;
-        if (!CollectSources(argc, argv, base + 1, targets)) return 3;
-        if (targets.empty()) {
-            fwprintf(stderr, L"[AngelCOPY] no items\n");
-            return 3;
-        }
+        if (!CollectOrFail(argc, argv, base + 1, targets)) return 3;
         if (consoleMode) {
             DeleteScan scan = ScanDelete(targets);
-            unsigned long long alloc = ScanAllocated(targets);
-            wprintf(L"files=%llu dirs=%llu bytes=%llu alloc=%llu\n", scan.files,
-                    scan.dirs, scan.bytes, alloc);
+            wprintf(L"files=%llu dirs=%llu bytes=%llu\n", scan.files, scan.dirs,
+                    scan.bytes);
             return 0;
         }
         ShowProps(targets);
@@ -217,15 +224,15 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring dest = argv[base + 1];
 
     std::vector<std::wstring> sources;
-    if (!CollectSources(argc, argv, base + 2, sources)) return 3;
-
-    if (sources.empty()) {
-        fwprintf(stderr, L"[AngelCOPY] no source items\n");
-        return 3;
-    }
+    if (!CollectOrFail(argc, argv, base + 2, sources)) return 3;
 
     std::vector<RoboJob> jobs =
         PlanJobs(op, dest, sources, loc::T(loc::S::CopyWord));
+
+    // The per-file skip-path lists feed only the robocopy fallback's output
+    // matching (SkipSetFor); the native engine reports skips itself. Skipping
+    // collection saves ~1M string allocations on a 500k-file re-mirror.
+    SetCollectSkipPaths(!UseNativeEngine());
 
     // Unreal preset (GUI only): a .uproject in a whole-tree source → offer to
     // skip the regenerable cache folders. Decided BEFORE the scan so totals,
@@ -250,8 +257,7 @@ int wmain(int argc, wchar_t** argv) {
             DeleteScan delScan = ScanDelete(extras);
             // Headless mirror deletes without a prompt — same explicit opt-in
             // as headless delete.
-            if (!extras.empty() &&
-                GetEnvironmentVariableW(L"ANGELCOPY_CONFIRM_DELETE", nullptr, 0) == 0) {
+            if (!extras.empty() && !ConsoleDeleteOptIn()) {
                 fwprintf(stderr,
                          L"[AngelCOPY] mirror would delete %llu items at the "
                          L"destination; refusing without a prompt.\n           Set "
@@ -349,6 +355,6 @@ int wmain(int argc, wchar_t** argv) {
     // paint those stretches green instead of counting them as speed.
     std::unordered_set<std::wstring> skipSet = SkipSetFor(scan, policy);
 
-    int code = RunJobsWithUI(op, dest, jobs, bytes, files, policy, skipped, skipSet);
+    int code = RunJobsWithUI(op, jobs, bytes, files, policy, skipped, skipSet);
     return (code >= 8) ? code : 0;
 }

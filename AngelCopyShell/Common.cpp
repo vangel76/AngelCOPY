@@ -28,34 +28,16 @@ std::wstring ModuleDir() {
 
 std::wstring RunnerPath() { return ModuleDir() + L"\\AngelCopyRunner.exe"; }
 
-wchar_t DriveLetter(const std::wstring& path) {
-    if (path.size() >= 2 && path[1] == L':') {
-        wchar_t c = path[0];
-        if (c >= L'a' && c <= L'z') c = (wchar_t)(c - L'a' + L'A');
-        return c;
-    }
-    return 0;
-}
+// ---- CF_HDROP extraction ----
 
-// ---- CF_HDROP extraction from an IDataObject ----
-bool GetHDropPaths(IDataObject* pdo, std::vector<std::wstring>& out) {
-    if (!pdo) return false;
-    FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM stg{};
-    if (FAILED(pdo->GetData(&fmt, &stg))) return false;
-
-    // A hostile drag source can return a different medium, or an HGLOBAL too
-    // small to hold a DROPFILES header. DragQueryFileW trusts the header's
-    // pFiles offset, so an undersized block walks past the allocation — inside
-    // explorer.exe, where this DLL lives.
-    if (stg.tymed != TYMED_HGLOBAL || !stg.hGlobal ||
-        GlobalSize(stg.hGlobal) < sizeof(DROPFILES)) {
-        ReleaseStgMedium(&stg);
-        return false;
-    }
-
+// The single place the hostile-HGLOBAL guard lives: any drag source or
+// clipboard writer can hand over a block too small for a DROPFILES header,
+// and DragQueryFileW trusts the header's pFiles offset — an undersized block
+// walks past the allocation, inside explorer.exe where this DLL lives.
+static bool ReadHDropGlobal(HANDLE h, std::vector<std::wstring>& out) {
+    if (!h || GlobalSize(h) < sizeof(DROPFILES)) return false;
     bool ok = false;
-    HDROP hDrop = static_cast<HDROP>(GlobalLock(stg.hGlobal));
+    HDROP hDrop = static_cast<HDROP>(GlobalLock(h));
     if (hDrop) {
         UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
         for (UINT i = 0; i < count; ++i) {
@@ -66,65 +48,40 @@ bool GetHDropPaths(IDataObject* pdo, std::vector<std::wstring>& out) {
             if (!buf.empty()) out.push_back(buf);
         }
         ok = count > 0;
-        GlobalUnlock(stg.hGlobal);
+        GlobalUnlock(h);
     }
-    ReleaseStgMedium(&stg);
     return ok;
 }
 
-DWORD GetPreferredDropEffect(IDataObject* pdo) {
-    if (!pdo) return 0;
-    static UINT cf = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
-    FORMATETC fmt{(CLIPFORMAT)cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM stg{};
-    if (FAILED(pdo->GetData(&fmt, &stg))) return 0;
+// Same shape for the 4-byte effect DWORD: a crafted block smaller than a
+// DWORD must not be read.
+static DWORD ReadEffectGlobal(HANDLE h) {
+    if (!h) return 0;
     DWORD effect = 0;
-    void* p = GlobalLock(stg.hGlobal);
-    // A crafted IDataObject can hand back a block smaller than a DWORD; reading
-    // 4 bytes from it would run past the allocation (a fault inside Explorer).
-    if (p && GlobalSize(stg.hGlobal) >= sizeof(DWORD)) {
+    void* p = GlobalLock(h);
+    if (p && GlobalSize(h) >= sizeof(DWORD))
         effect = *reinterpret_cast<DWORD*>(p);
-    }
-    if (p) GlobalUnlock(stg.hGlobal);
-    ReleaseStgMedium(&stg);
+    if (p) GlobalUnlock(h);
     return effect;
 }
 
-// ---- Clipboard ----
-bool ClipboardHasHDrop() { return IsClipboardFormatAvailable(CF_HDROP) != FALSE; }
+bool GetHDropPaths(IDataObject* pdo, std::vector<std::wstring>& out) {
+    if (!pdo) return false;
+    FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM stg{};
+    if (FAILED(pdo->GetData(&fmt, &stg))) return false;
+    bool ok = (stg.tymed == TYMED_HGLOBAL) && ReadHDropGlobal(stg.hGlobal, out);
+    ReleaseStgMedium(&stg);
+    return ok;
+}
 
 bool GetClipboardHDrop(std::vector<std::wstring>& out, DWORD& effect) {
     effect = 0;
     if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
     if (!OpenClipboard(nullptr)) return false;
-
-    bool ok = false;
-    HANDLE h = GetClipboardData(CF_HDROP);
-    // Same guard as GetHDropPaths: any process can put a short CF_HDROP block
-    // on the clipboard, and DragQueryFileW would read past it.
-    if (h && GlobalSize(h) >= sizeof(DROPFILES)) {
-        HDROP hDrop = static_cast<HDROP>(GlobalLock(h));
-        if (hDrop) {
-            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-            for (UINT i = 0; i < count; ++i) {
-                UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
-                std::wstring buf(len + 1, L'\0');
-                DragQueryFileW(hDrop, i, &buf[0], len + 1);
-                buf.resize(len);
-                if (!buf.empty()) out.push_back(buf);
-            }
-            ok = count > 0;
-            GlobalUnlock(h);
-        }
-    }
+    bool ok = ReadHDropGlobal(GetClipboardData(CF_HDROP), out);
     UINT cf = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
-    HANDLE he = GetClipboardData(cf);
-    if (he) {
-        void* p = GlobalLock(he);
-        if (p && GlobalSize(he) >= sizeof(DWORD))
-            effect = *reinterpret_cast<DWORD*>(p);
-        if (p) GlobalUnlock(he);
-    }
+    effect = ReadEffectGlobal(GetClipboardData(cf));
     CloseClipboard();
     return ok;
 }

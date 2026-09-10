@@ -33,9 +33,8 @@ DELETE
 PROPERTIES (FAST)
   Folder or multi-selection → Alt+Enter or right-click "Properties FAST":
   size and file count are counted in parallel — much faster than the
-  Windows dialog. "Compute size on disk" adds the on-disk figure,
-  "Windows properties…" opens the original (Security, Sharing, …).
-  Single files keep the normal Windows dialog.
+  Windows dialog. "Windows properties…" opens the original (Security,
+  Sharing, …). Single files keep the normal Windows dialog.
 
 THE PROGRESS DIALOG
   • Green stretches in the bar = skipped (already up to date at the target).
@@ -50,3 +49,5 @@ WINDOWS 11
 
 This guide any time: Start menu → AngelCOPY → "AngelCOPY Guide"
 (or type "AngelCOPY Guide" into Windows search)
+
+AngelCOPY — © Valentin Klein

@@ -27,12 +27,6 @@ struct DeleteScan {
 DeleteScan ScanDelete(const std::vector<std::wstring>& targets,
                       ScanProgress* prog = nullptr);
 
-// Size on disk (Explorer's figure): cluster-rounded, true allocation for
-// compressed/sparse files. Recursive, does not follow junctions. `prog`
-// (optional): live total in prog->bytes, cancellation via prog->cancel.
-unsigned long long ScanAllocated(const std::vector<std::wstring>& targets,
-                                 ScanProgress* prog = nullptr);
-
 struct DeleteSink {
     std::function<void(const std::wstring& path, unsigned long long size)> onFile;
     std::function<void(const std::wstring& message)> onError;

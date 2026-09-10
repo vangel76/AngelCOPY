@@ -97,14 +97,14 @@ build.bat                                             REM -> dist\*.dll, *.exe
   - `ConflictUI.cpp` — pre-transfer conflict prompt (Replace / Only if newer /
     Skip / Cancel). `ConfirmUI.cpp` — the mandatory delete confirmation.
   - `Delete.cpp` — own recursive deleter (no robocopy; see gotchas). Also
-    holds the parallel counters: `ScanDelete` (files/dirs/bytes, feeds the
-    delete prompt AND the properties dialog) and `ScanAllocated` (size on
-    disk), both on the shared `ScanWork`/`DrainScanWork` 8-worker queue.
+    holds `ScanDelete` (files/dirs/bytes, feeds the delete prompt AND the
+    properties dialog) on the `ScanWork`/`DrainScanWork` 8-worker queue.
   - `PropsUI.cpp` — fast properties dialog (`props` op; Alt+Enter /
     "Properties FAST"). Opens instantly, counts live via ScanDelete's
-    ScanProgress atomics (100 ms timer), size-on-disk only on button click
-    (`ScanAllocated`: extra round-trip per compressed/sparse file, cluster
-    rounding otherwise from find data — nearly free). "Windows properties…"
+    ScanProgress atomics (100 ms timer). A "size on disk" button existed
+    briefly and was removed on request (Sep 2026) — the user judged the
+    on-disk figure pointless; don't bring it back unasked. "Windows
+    properties…"
     invokes the native sheet (verb `properties` / `SHMultiFileProperties`);
     the sheet runs on a thread INSIDE the runner process, so `ShowProps`
     keeps the process alive until every visible window is gone — exiting
@@ -134,8 +134,13 @@ build.bat                                             REM -> dist\*.dll, *.exe
       (`ScanTree`, `WalkStream`) AND the purge walk (`FindExtras`) — if the
       purge saw it, it would delete the very cache the user kept, because the
       copy never wrote it so it reads as "not in source". The check goes BEFORE
-      the recursion in all three. Robocopy fallback emits `/XD`. Console never
-      excludes. Regression: `tests\test_sync.cpp` (purge-safety, validated to
+      the recursion in all three. Robocopy fallback emits `/XD` (from the
+      ACTUAL set via `ExcludedDirNames()`, not the Unreal constant). Console
+      never excludes. **The whole-tree rename fast paths refuse when
+      exclusions are active** (`TryQuickRenameMove` AND `TryRenameTree`): a
+      rename would move the excluded caches along, silently ignoring the
+      user's checkbox — the per-file path is the only one that can honor it.
+      Regression: `tests\test_sync.cpp` (purge-safety, validated to
       fail without the FindExtras guard) + `tests\test_native.cpp` (copy walk).
     - **Same-folder copy ("<name> - Kopie"):** pasting an item into the folder it
     already lives in makes a renamed copy (Explorer behavior) instead of
@@ -152,6 +157,18 @@ build.bat                                             REM -> dist\*.dll, *.exe
   `AngelCopyShell/Common.cpp` (clipboard + LaunchRunner; `g_hModule` stays
   null -> ModuleDir() = exe dir) and `shared/Localize.cpp`.
 - `shared/Localize.*` — all user-visible strings, compiled into ALL binaries.
+- `shared/Util.h` — header-only helpers shared by ALL binaries:
+  `acutil::ExtLongPath` (THE canonical `\\?\` prefixer — the per-file
+  `Ext`/`ExtPath`/`ExtP` wrappers forward here; the copies had drifted once),
+  `HumanBytes`, `LowerCopy`, `WinErrText`. Header-only on purpose: no
+  build-script change, tests compiling single .cpp files keep working, the
+  DLL gains no dependency.
+- `AngelCopyRunner/BatchQueue.h` — the one producer→pool streaming batch
+  queue (mutex/cv/deque of per-directory batches) used by the copy walk
+  (`ChunkQueue`), the scan classification (`ScanQueue`) and the deleter
+  (`DelQueue`) via `using` aliases. All three producers split batches at
+  ~256 files — that split is what stops one flat directory from pinning a
+  single worker (the scan was missing it until Sep 2026).
 - `installer/AngelCOPY.iss` — Inno Setup. DLL entry has `regserver` (Inno calls
   Dll(Un)RegisterServer) + `uninsrestartdelete`; restarts Explorer on
   install/uninstall. Quick guide `installer/Anleitung-{de,en}.txt` (UTF-8 WITH
@@ -393,6 +410,16 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **The deleter must not follow reparse points.** Junctions/symlinks are removed
   with `RemoveDirectoryW`, never recursed into — recursing would delete the
   link target's contents (someone else's data). There is a test for this.
+- **The installer's Explorer-window restore runs entirely as the ORIGINAL
+  user.** Two failures shipped before it worked (Sep 2026): the elevated
+  setup process sees an EMPTY `Shell.Application.Windows` list (saved 0
+  windows while the user had several open), and PowerShell 5.1's
+  `Start-Process -ArgumentList` does NOT quote arguments with spaces —
+  explorer.exe got split arguments and opened the default window instead of
+  the saved folder. Hence: save AND restore via `ExecAsOriginalUser` +
+  powershell, the path list in the user's own `$env:TEMP` (never the
+  elevated `{tmp}`), and explicit `"` around each path. Also: a [Code]
+  continuation line starting with `[` parses as a section tag.
 - **Installer `[Run]` entries MUST carry `runasoriginaluser`.** Setup elevates
   (`PrivilegesRequired=admin`) and `[Run]` inherits that token — without the
   flag the agent ran at HIGH integrity all session (measured), so every Ctrl+V
@@ -486,7 +513,10 @@ build.bat                                             REM -> dist\*.dll, *.exe
     only discriminator is the path: `SkipSetFor(scan, policy)` holds the
     lowercased source paths robocopy will list but not copy, and it must mirror
     `SkippedFor` exactly (under Replace, newer/older files ARE copied and must
-    not be in the set).
+    not be in the set). **Only the robocopy fallback consumes this set** — the
+    scan collects the per-file path lists solely when `SetCollectSkipPaths`
+    left collection on (main.cpp turns it off for native runs: the lists were
+    ~1M pinned string allocations per 500k-file re-mirror, feeding nothing).
   - robocopy also lists **"extra" files** (present only at the destination) as
     the same line shape — with their *destination* path. Filter lines whose
     path is under any job's dstDir, or every extra inflates the file counter
@@ -507,6 +537,12 @@ build.bat                                             REM -> dist\*.dll, *.exe
   Correct answer: a sliding ~3s window while copying, whole-transfer average
   (labelled) once done. Validate against real destination byte growth, not
   Task Manager — TM counts read+write, so a same-disk copy shows ~2x there.
+- **The progress lock was never the bottleneck — don't shave it further.**
+  Measured Sep 2026 (30k x 1 KiB GUI copy, 5+5 interleaved): all-counters-
+  under-one-CS 6964 ms vs lock-free atomics 6957 ms. The atomics stayed
+  (clearer ownership, currentFile throttled to 50 ms saves real string
+  copies), but any future "optimize the progress lock" idea is already
+  answered: the copy is I/O-bound.
 - **Speed and ETA use different figures on purpose.** Speed = sliding window
   (what is happening now). ETA = overall average (`done / elapsed`), because the
   window makes the estimate jump on every burst. Don't "unify" them.

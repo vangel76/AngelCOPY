@@ -30,6 +30,7 @@
 
 #include "../AngelCopyShell/Common.h"
 #include "../shared/Localize.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -145,6 +146,19 @@ LONG g_vHeld = 0;
 LONG g_delHeld = 0;
 LONG g_enterHeld = 0;
 
+// Modifier snapshot for the chord checks below. Same cheap GetAsyncKeyState
+// calls as before, just factored — the hook-callback cheapness law holds.
+struct Mods {
+    bool ctrl, shift, alt, win;
+};
+Mods ReadMods() {
+    return {(GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0,
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0,
+            (GetAsyncKeyState(VK_MENU) & 0x8000) != 0,
+            ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) !=
+                0};
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION) {
         const KBDLLHOOKSTRUCT* kk = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
@@ -166,12 +180,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
         const KBDLLHOOKSTRUCT* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && k->vkCode == 'V' &&
             !(k->flags & LLKHF_INJECTED)) {          // never touch our replay
-            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-            const bool win = ((GetAsyncKeyState(VK_LWIN) |
-                               GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
-            if (ctrl && !shift && !alt && !win) {
+            const Mods m = ReadMods();
+            if (m.ctrl && !m.shift && !m.alt && !m.win) {
                 HWND target = nullptr;
                 WPARAM reason = InterceptReason(&target);
                 if (g_debug) PostMessageW(g_msgWnd, WM_APP_DEBUG, reason, 0);
@@ -193,12 +203,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
         // main thread; if there is none the keystroke is replayed native.
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && k->vkCode == VK_DELETE &&
             !(k->flags & LLKHF_INJECTED)) {
-            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-            const bool win = ((GetAsyncKeyState(VK_LWIN) |
-                               GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
-            if (shift && !ctrl && !alt && !win) {
+            const Mods m = ReadMods();
+            if (m.shift && !m.ctrl && !m.alt && !m.win) {
                 HWND target = ExplorerTargetOrNull();
                 if (target) {
                     if (InterlockedExchange(&g_delHeld, 1) == 0) {
@@ -216,12 +222,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
         // replayed native.
         if (wp == WM_SYSKEYDOWN && k->vkCode == VK_RETURN &&
             !(k->flags & LLKHF_INJECTED)) {
-            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-            const bool win = ((GetAsyncKeyState(VK_LWIN) |
-                               GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
-            if (alt && !ctrl && !shift && !win) {
+            const Mods m = ReadMods();
+            if (m.alt && !m.ctrl && !m.shift && !m.win) {
                 HWND target = ExplorerTargetOrNull();
                 if (target) {
                     if (InterlockedExchange(&g_enterHeld, 1) == 0) {
@@ -238,20 +240,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp) {
 
 // ---- main-thread side ------------------------------------------------------
 
-// Give the keystroke back to Windows: inject Ctrl+V (Ctrl is usually still
-// physically held; inject a down anyway for the released-early case). The
-// hook ignores injected events, so this reaches Explorer untouched.
-void ReplayCtrlV() {
+// Give a swallowed chord back to Windows: inject modifier+key (the modifier
+// is usually still physically held; inject a down anyway for the
+// released-early case). The hook ignores injected events (LLKHF_INJECTED),
+// so the replay reaches Explorer untouched and cannot loop.
+void ReplayChord(WORD mod, WORD key) {
     INPUT in[4]{};
     for (auto& i : in) i.type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_CONTROL;
-    in[1].ki.wVk = 'V';
-    in[2].ki.wVk = 'V';
+    in[0].ki.wVk = mod;
+    in[1].ki.wVk = key;
+    in[2].ki.wVk = key;
     in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3].ki.wVk = VK_CONTROL;
+    in[3].ki.wVk = mod;
     in[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(4, in, sizeof(INPUT));
 }
+
+void ReplayCtrlV() { ReplayChord(VK_CONTROL, 'V'); }
 
 // The active IShellView of the Explorer window `target` (AddRef'd, caller
 // releases), or nullptr if `target` isn't a shell-browser window. Both the
@@ -296,20 +301,7 @@ IShellView* GetActiveShellView(HWND target) {
     return found;
 }
 
-// Give Shift+Delete back to Windows (native permanent delete). Shift is
-// usually still held; inject it anyway for the released-early case. The hook
-// ignores injected events, so this reaches Explorer untouched.
-void ReplayShiftDelete() {
-    INPUT in[4]{};
-    for (auto& i : in) i.type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_SHIFT;
-    in[1].ki.wVk = VK_DELETE;
-    in[2].ki.wVk = VK_DELETE;
-    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3].ki.wVk = VK_SHIFT;
-    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(4, in, sizeof(INPUT));
-}
+void ReplayShiftDelete() { ReplayChord(VK_SHIFT, VK_DELETE); }
 
 // Filesystem path of the folder shown in Explorer window `target`; L"" for
 // virtual locations (This PC, zips, ...) — those get the native paste.
@@ -396,25 +388,11 @@ void DoDelete() {
         ReplayShiftDelete();
 }
 
-// Give Alt+Enter back to Windows (native properties sheet). Same injected-
-// replay pattern as the other two shortcuts.
-void ReplayAltEnter() {
-    INPUT in[4]{};
-    for (auto& i : in) i.type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_MENU;
-    in[1].ki.wVk = VK_RETURN;
-    in[2].ki.wVk = VK_RETURN;
-    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3].ki.wVk = VK_MENU;
-    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(4, in, sizeof(INPUT));
-}
+void ReplayAltEnter() { ReplayChord(VK_MENU, VK_RETURN); }
 
 // Directory test that survives >MAX_PATH (the shell hands us plain paths).
 bool IsDirLong(const std::wstring& p) {
-    std::wstring x = (p.rfind(L"\\\\", 0) == 0) ? L"\\\\?\\UNC\\" + p.substr(2)
-                                                : L"\\\\?\\" + p;
-    DWORD a = GetFileAttributesW(x.c_str());
+    DWORD a = GetFileAttributesW(acutil::ExtLongPath(p).c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 

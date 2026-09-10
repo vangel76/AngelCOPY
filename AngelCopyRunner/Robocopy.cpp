@@ -1,13 +1,12 @@
 #include "Robocopy.h"
+#include "BatchQueue.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <shlwapi.h>
 #include <algorithm>
-#include <condition_variable>
-#include <cwctype>
-#include <deque>
+#include <array>
 #include <map>
-#include <mutex>
 #include <thread>
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -67,23 +66,22 @@ std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
 // Without this, FindFirstFile on a >MAX_PATH path fails and the scan silently
 // omits those files — a copy reported complete but short, and (worse) in a
 // mirror an existing source read as "missing" so its destination twin was
-// purged. Mirrors Delete.cpp's Ext()/NativeCopy.cpp's ExtPath().
-std::wstring Ext(const std::wstring& p) {
-    if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) return p;
-    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\')
-        return L"\\\\?\\UNC\\" + p.substr(2);
-    return L"\\\\?\\" + p;
-}
+// purged. Canonical implementation: acutil::ExtLongPath (shared\Util.h).
+std::wstring Ext(const std::wstring& p) { return acutil::ExtLongPath(p); }
 
-std::wstring LowerCopy(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](wchar_t c) { return (wchar_t)std::towlower(c); });
-    return s;
-}
+std::wstring LowerCopy(std::wstring s) { return acutil::LowerCopy(std::move(s)); }
 
 // Set once in main before any scan/transfer, read-only thereafter from every
 // walk thread (see Robocopy.h). Lowercased directory names.
 std::unordered_set<std::wstring> g_excludedDirs;
+
+// Whether Account() collects the per-file skip-path lists (samePaths etc.).
+// Only the robocopy fallback engine reads the SkipSetFor set built from them
+// (pipe-line matching); the native engine reports skips itself. Defaults ON
+// so the unit tests and the fallback keep their lists; main.cpp switches it
+// off for native runs — on a 500k-file re-mirror the lists were ~1M string
+// allocations pinned for the whole transfer, feeding nothing.
+bool g_collectSkipPaths = true;
 
 bool SamePath(const std::wstring& a, const std::wstring& b) {
     return LowerCopy(StripTrailingSep(a)) == LowerCopy(StripTrailingSep(b));
@@ -216,8 +214,12 @@ std::wstring BuildRobocopyArgs(Operation op, const RoboJob& job, bool parseable,
     // loose-file job has no subdirs to exclude. robocopy /XD is case-insensitive
     // and excludes from the purge too, matching the native walk's behavior.
     if (job.files.empty() && AnyExcludedDirs()) {
+        // Emit the ACTUAL exclusion state, not UnrealExcludeNames(): the
+        // fallback engine must not diverge from the native walks if the set
+        // ever comes from somewhere else. (Lowercased is fine — /XD is
+        // case-insensitive.)
         args += L" /XD";
-        for (const auto& n : UnrealExcludeNames()) { args += L" "; args += Quote(n); }
+        for (const auto& n : ExcludedDirNames()) { args += L" "; args += Quote(n); }
     }
 
     // Conflict handling. robocopy's default overwrites anything that differs —
@@ -305,17 +307,17 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
         return;
     case FileClass::Same:
         acc.sameFiles++;   acc.sameBytes += size;
-        acc.samePaths.push_back(LowerCopy(src));
+        if (g_collectSkipPaths) acc.samePaths.push_back(LowerCopy(src));
         return;
     case FileClass::DiffNewer:
         acc.newerFiles++;  acc.newerBytes += size;
         acc.newerGrowBytes += grow;
-        acc.newerPaths.push_back(LowerCopy(src));
+        if (g_collectSkipPaths) acc.newerPaths.push_back(LowerCopy(src));
         break;
     case FileClass::DiffOlder:
         acc.olderFiles++;  acc.olderBytes += size;
         acc.olderGrowBytes += grow;
-        acc.olderPaths.push_back(LowerCopy(src));
+        if (g_collectSkipPaths) acc.olderPaths.push_back(LowerCopy(src));
         break;
     }
     acc.conflicts++;
@@ -354,35 +356,12 @@ struct ScanFileItem {
     FILETIME mtime;
 };
 
-struct ScanQueue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::vector<ScanFileItem>> q;
-    bool closed = false;
+using ScanQueue = BatchQueue<ScanFileItem>;
 
-    void Push(std::vector<ScanFileItem>&& batch) {
-        {
-            std::lock_guard<std::mutex> l(m);
-            q.push_back(std::move(batch));
-        }
-        cv.notify_one();
-    }
-    bool Pop(std::vector<ScanFileItem>& out) {
-        std::unique_lock<std::mutex> l(m);
-        cv.wait(l, [&] { return closed || !q.empty(); });
-        if (q.empty()) return false;
-        out = std::move(q.front());
-        q.pop_front();
-        return true;
-    }
-    void Close() {
-        {
-            std::lock_guard<std::mutex> l(m);
-            closed = true;
-        }
-        cv.notify_all();
-    }
-};
+// Same safety net as the copy/delete chunk split: without a cap one flat
+// 100k-file directory would land as ONE batch on ONE of the 8 workers while
+// the other 7 idle — on exactly the latency-bound load this pool exists for.
+constexpr size_t kScanBatchFiles = 256;
 
 // Walk one tree, pushing per-directory batches of files that still need the
 // destination stat. Files under a missing destination dir are accounted
@@ -396,6 +375,9 @@ void WalkForScan(const std::wstring& srcDir, const std::wstring& dstDir,
                                 &fd, FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return;
     std::vector<ScanFileItem> batch;
+    auto flush = [&] {
+        if (!batch.empty()) { queue.Push(std::move(batch)); batch = {}; }
+    };
     do {
         if (prog && prog->cancel.load(std::memory_order_relaxed)) break;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
@@ -405,10 +387,9 @@ void WalkForScan(const std::wstring& srcDir, const std::wstring& dstDir,
             IsExcludedDir(fd.cFileName))
             continue; // /XD
 
-        std::wstring src = srcDir + L"\\" + fd.cFileName;
-        std::wstring dst = dstDir + L"\\" + fd.cFileName;
-
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            std::wstring src = srcDir + L"\\" + fd.cFileName;
+            std::wstring dst = dstDir + L"\\" + fd.cFileName;
             bool childDst = dstExists && IsDirectory(dst);
             WalkForScan(src, dst, lonelyAcc, prog, queue, depth + 1, childDst);
         } else {
@@ -416,15 +397,19 @@ void WalkForScan(const std::wstring& srcDir, const std::wstring& dstDir,
             unsigned long long size =
                 ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             if (!dstExists) {
-                Account(lonelyAcc, FileClass::Lonely, size, 0, src, dst);
+                // Lonely by construction: Account uses neither path for this
+                // class, so the fast path builds no strings at all.
+                Account(lonelyAcc, FileClass::Lonely, size, 0, L"", L"");
             } else {
-                batch.push_back(ScanFileItem{std::move(src), std::move(dst),
+                batch.push_back(ScanFileItem{srcDir + L"\\" + fd.cFileName,
+                                             dstDir + L"\\" + fd.cFileName,
                                              size, fd.ftLastWriteTime});
+                if (batch.size() >= kScanBatchFiles) flush();
             }
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    if (!batch.empty()) queue.Push(std::move(batch));
+    flush();
 }
 
 void MergeScan(ScanResult& into, ScanResult& from) {
@@ -504,29 +489,49 @@ ScanResult ScanJobs(const std::vector<RoboJob>& jobs, ScanProgress* prog) {
     return r;
 }
 
+bool PolicyCopies(Conflict policy, FileClass fc) {
+    switch (fc) {
+    case FileClass::Lonely:    return true;  // nothing at the destination
+    case FileClass::Same:      return false; // identical is never copied
+    case FileClass::DiffNewer: return policy != Conflict::Skip;
+    case FileClass::DiffOlder: return policy == Conflict::Replace;
+    }
+    return true;
+}
+
+namespace {
+
+// The four class buckets of a ScanResult, so the aggregates below iterate
+// against PolicyCopies instead of each re-encoding the policy by hand.
+struct ClassBucket {
+    FileClass fc;
+    unsigned long long files, bytes;
+    const std::vector<std::wstring>* paths; // null for Lonely (never skipped)
+};
+
+std::array<ClassBucket, 4> BucketsOf(const ScanResult& s) {
+    return {{{FileClass::Lonely, s.lonelyFiles, s.lonelyBytes, nullptr},
+             {FileClass::Same, s.sameFiles, s.sameBytes, &s.samePaths},
+             {FileClass::DiffNewer, s.newerFiles, s.newerBytes, &s.newerPaths},
+             {FileClass::DiffOlder, s.olderFiles, s.olderBytes, &s.olderPaths}}};
+}
+
+} // namespace
+
 void ExpectedFor(const ScanResult& s, Conflict policy,
                  unsigned long long& bytes, unsigned long long& files) {
-    // "Same" files are never copied under any policy, so they never count.
-    bytes = s.lonelyBytes;
-    files = s.lonelyFiles;
-    if (policy == Conflict::Replace || policy == Conflict::ReplaceIfNewer) {
-        bytes += s.newerBytes;
-        files += s.newerFiles;
-    }
-    if (policy == Conflict::Replace) { // /XO would exclude these
-        bytes += s.olderBytes;
-        files += s.olderFiles;
-    }
+    bytes = files = 0;
+    for (const auto& b : BucketsOf(s))
+        if (PolicyCopies(policy, b.fc)) { bytes += b.bytes; files += b.files; }
 }
 
 unsigned long long NeededSpaceFor(const ScanResult& s, Conflict policy) {
-    // Lonely files cost their full size; overwrites cost only their growth
-    // (in-place, measured). Same files cost nothing under any policy.
+    // Lonely files cost their full size; overwrites cost only their GROWTH
+    // (in-place, measured) — deliberately not a plain bucket sum. Which
+    // classes are overwritten at all still comes from the shared predicate.
     unsigned long long need = s.lonelyBytes;
-    if (policy == Conflict::Replace || policy == Conflict::ReplaceIfNewer)
-        need += s.newerGrowBytes;
-    if (policy == Conflict::Replace)
-        need += s.olderGrowBytes;
+    if (PolicyCopies(policy, FileClass::DiffNewer)) need += s.newerGrowBytes;
+    if (PolicyCopies(policy, FileClass::DiffOlder)) need += s.olderGrowBytes;
     return need;
 }
 
@@ -605,41 +610,30 @@ std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs,
 }
 
 std::unordered_set<std::wstring> SkipSetFor(const ScanResult& s, Conflict policy) {
-    // Must mirror SkippedFor exactly: same files always skip; the policy adds
-    // its excluded classes. Under Replace, newer/older files ARE copied and
-    // must not be in the set, or real copies would be painted as skips.
-    std::unordered_set<std::wstring> set(s.samePaths.begin(), s.samePaths.end());
-    switch (policy) {
-    case Conflict::Replace:
-        break;
-    case Conflict::ReplaceIfNewer:
-        set.insert(s.olderPaths.begin(), s.olderPaths.end());
-        break;
-    case Conflict::Skip:
-        set.insert(s.newerPaths.begin(), s.newerPaths.end());
-        set.insert(s.olderPaths.begin(), s.olderPaths.end());
-        break;
-    }
+    // Exactly the paths of every class the policy does NOT copy — under
+    // Replace, newer/older files ARE copied and must not be in the set, or
+    // real copies would be painted as skips. Same predicate as SkippedFor by
+    // construction.
+    std::unordered_set<std::wstring> set;
+    for (const auto& b : BucketsOf(s))
+        if (!PolicyCopies(policy, b.fc) && b.paths)
+            set.insert(b.paths->begin(), b.paths->end());
     return set;
 }
 
 SkipInfo SkippedFor(const ScanResult& s, Conflict policy) {
     SkipInfo k;
-    // Identical files are skipped by robocopy under every policy.
-    k.identicalFiles = s.sameFiles;
-    k.identicalBytes = s.sameBytes;
-
-    switch (policy) {
-    case Conflict::Replace:
-        break; // nothing else skipped
-    case Conflict::ReplaceIfNewer: // /XO drops older sources
-        k.policyFiles = s.olderFiles;
-        k.policyBytes = s.olderBytes;
-        break;
-    case Conflict::Skip: // /XC /XN /XO drops everything already there
-        k.policyFiles = s.newerFiles + s.olderFiles;
-        k.policyBytes = s.newerBytes + s.olderBytes;
-        break;
+    for (const auto& b : BucketsOf(s)) {
+        if (PolicyCopies(policy, b.fc)) continue;
+        if (b.fc == FileClass::Same) {
+            // Identical files are skipped under every policy — reported as
+            // their own line ("already up to date"), not as a policy skip.
+            k.identicalFiles = b.files;
+            k.identicalBytes = b.bytes;
+        } else {
+            k.policyFiles += b.files;
+            k.policyBytes += b.bytes;
+        }
     }
     return k;
 }
@@ -690,11 +684,26 @@ void SetExcludedDirs(const std::vector<std::wstring>& names) {
     for (const auto& n : names) g_excludedDirs.insert(LowerCopy(n));
 }
 
+void SetCollectSkipPaths(bool on) { g_collectSkipPaths = on; }
+
 bool IsExcludedDir(const std::wstring& name) {
     return !g_excludedDirs.empty() && g_excludedDirs.count(LowerCopy(name)) > 0;
 }
 
+// find-data overload: the walks call this with fd.cFileName for EVERY
+// directory entry; without it the wstring parameter forced a heap temporary
+// before the empty() early-out could run — an allocation per directory in
+// copy, scan and purge, even with no exclusions set (the common case).
+bool IsExcludedDir(const wchar_t* name) {
+    if (g_excludedDirs.empty()) return false;
+    return IsExcludedDir(std::wstring(name));
+}
+
 bool AnyExcludedDirs() { return !g_excludedDirs.empty(); }
+
+std::vector<std::wstring> ExcludedDirNames() {
+    return {g_excludedDirs.begin(), g_excludedDirs.end()};
+}
 
 const std::vector<std::wstring>& UnrealExcludeNames() {
     // The four regenerable folders from the user's own robocopy /XD line.
