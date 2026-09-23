@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <atomic>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -67,6 +68,11 @@ std::wstring BuildRobocopyArgs(Operation op, const RoboJob& job, bool parseable,
 // Location of robocopy.exe in the real System32.
 std::wstring RobocopyExe();
 
+// How robocopy will treat a source file given what's at the destination.
+// Public because the native engine (NativeCopy.cpp) must make the exact same
+// per-file decision the scan made, or totals and outcomes drift apart.
+enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
+
 // Pre-scan across all jobs: total bytes/files (drives the percentage bar) plus
 // the destination files that already exist AND differ from the source — i.e.
 // exactly the files robocopy would silently overwrite. Identical files are not
@@ -92,14 +98,17 @@ struct ScanResult {
     // a copy line: with /V robocopy lists skipped files too, and under /NC the
     // two line kinds are textually identical — only the path says which is which.
     std::vector<std::wstring> samePaths, newerPaths, olderPaths;
+
+    // Per-file verdicts (lowercased source path -> class), collected only when
+    // SetCollectClasses is on. Handed to the engine via SetCarriedClasses so
+    // the copy phase skips its second round of destination stats — on a
+    // skip-heavy mirror over a slow target those re-stats WERE the copy
+    // phase. Fast-path Lonely files (destination dir absent) are not in here;
+    // the engine's dstFresh shortcut covers them statlessly anyway.
+    std::unordered_map<std::wstring, FileClass> classes;
 };
 ScanResult ScanJobs(const std::vector<RoboJob>& jobs,
                     ScanProgress* prog = nullptr);
-
-// How robocopy will treat a source file given what's at the destination.
-// Public because the native engine (NativeCopy.cpp) must make the exact same
-// per-file decision the scan made, or totals and outcomes drift apart.
-enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
 
 // Mirrors robocopy's own comparison: identical == same size and write-time
 // within 2s (FAT/network timestamp granularity). Fills `dstSize` (0 when the
@@ -175,6 +184,20 @@ std::vector<std::wstring> ExcludedDirNames(); // the active set (lowercased)
 // Only the robocopy fallback engine reads that set; main.cpp switches
 // collection off for native runs (default: on, for tests and fallback).
 void SetCollectSkipPaths(bool on);
+
+// Carried classification: the scan's per-file verdicts, handed to the native
+// engine so the copy phase consumes them instead of re-statting every
+// destination file (the second stat round doubled "slow target" mirrors).
+// Process-wide like the exclusion set: set once between scan and run, read
+// concurrently by the copy pool. A map larger than kMaxCarriedClasses is
+// DISCARDED (memory cap; the engine then re-classifies as before). A lookup
+// miss (file appeared/changed since the scan) also falls back to a real
+// ClassifyFile — carried verdicts are an optimization, never the only truth.
+constexpr size_t kMaxCarriedClasses = 400000; // ~100 MB worst case
+void SetCollectClasses(bool on); // scan-side collection (default: off)
+void SetCarriedClasses(std::unordered_map<std::wstring, FileClass>&& m);
+bool AnyCarriedClasses();
+bool LookupCarriedClass(const std::wstring& srcLower, FileClass& fc);
 
 // The Unreal cache/derived folders the preset skips (proper case, for display
 // and for SetExcludedDirs).

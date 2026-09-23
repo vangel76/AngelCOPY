@@ -83,6 +83,13 @@ std::unordered_set<std::wstring> g_excludedDirs;
 // allocations pinned for the whole transfer, feeding nothing.
 bool g_collectSkipPaths = true;
 
+// Whether Account() collects per-file verdicts into ScanResult::classes for
+// the engine carry (default OFF: tests and the robocopy fallback don't use
+// it). Set between the confirmation and the run, read concurrently by the
+// copy pool afterwards — same lifecycle contract as g_excludedDirs.
+bool g_collectClasses = false;
+std::unordered_map<std::wstring, FileClass> g_carriedClasses;
+
 bool SamePath(const std::wstring& a, const std::wstring& b) {
     return LowerCopy(StripTrailingSep(a)) == LowerCopy(StripTrailingSep(b));
 }
@@ -297,10 +304,18 @@ FileClass ClassifyFile(const std::wstring& dst, unsigned long long srcSize,
 
 namespace {
 
+void CollectClass(ScanResult& acc, FileClass fc, const std::wstring& src) {
+    // Fast-path Lonely entries arrive with an empty src (no strings built);
+    // the engine's dstFresh shortcut covers those statlessly anyway.
+    if (g_collectClasses && !src.empty())
+        acc.classes.emplace(LowerCopy(src), fc);
+}
+
 void Account(ScanResult& acc, FileClass fc, unsigned long long size,
              unsigned long long dstSize, const std::wstring& src,
              const std::wstring& dst) {
     unsigned long long grow = (size > dstSize) ? size - dstSize : 0;
+    CollectClass(acc, fc, src);
     switch (fc) {
     case FileClass::Lonely:
         acc.lonelyFiles++; acc.lonelyBytes += size;
@@ -430,6 +445,8 @@ void MergeScan(ScanResult& into, ScanResult& from) {
     app(into.samePaths, from.samePaths);
     app(into.newerPaths, from.newerPaths);
     app(into.olderPaths, from.olderPaths);
+    if (into.classes.empty()) into.classes = std::move(from.classes);
+    else into.classes.merge(from.classes);
 }
 
 } // namespace
@@ -685,6 +702,24 @@ void SetExcludedDirs(const std::vector<std::wstring>& names) {
 }
 
 void SetCollectSkipPaths(bool on) { g_collectSkipPaths = on; }
+
+void SetCollectClasses(bool on) { g_collectClasses = on; }
+
+void SetCarriedClasses(std::unordered_map<std::wstring, FileClass>&& m) {
+    // Memory cap: a huge tree's verdict map is discarded rather than pinned —
+    // the engine then re-classifies streamed, exactly as before the carry.
+    if (m.size() > kMaxCarriedClasses) m.clear();
+    g_carriedClasses = std::move(m);
+}
+
+bool AnyCarriedClasses() { return !g_carriedClasses.empty(); }
+
+bool LookupCarriedClass(const std::wstring& srcLower, FileClass& fc) {
+    auto it = g_carriedClasses.find(srcLower);
+    if (it == g_carriedClasses.end()) return false;
+    fc = it->second;
+    return true;
+}
 
 bool IsExcludedDir(const std::wstring& name) {
     return !g_excludedDirs.empty() && g_excludedDirs.count(LowerCopy(name)) > 0;

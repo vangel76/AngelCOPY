@@ -1156,6 +1156,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        theme::SaveWindowPos(hwnd); // remembered spot for the next transfer
         KillTimer(hwnd, 1);
         PostQuitMessage(0);
         return 0;
@@ -1225,6 +1226,7 @@ int RunUI(const std::wstring& caption, const std::wstring& heading,
     const int W = rc.right - rc.left, H = rc.bottom - rc.top;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+    theme::LoadWindowPos(sx, sy, W, H); // remembered spot, if still on-screen
 
     HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName, caption.c_str(),
                                 kStyle, sx, sy, W, H, nullptr, nullptr, hInst,
@@ -1493,6 +1495,8 @@ bool RunScanWithUI(ScanProgress& prog, const std::function<void()>& work) {
     const int W = rc.right - rc.left, H = rc.bottom - rc.top;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
+    // Same remembered spot as the transfer dialog so Preparing doesn't jump.
+    theme::LoadWindowPos(sx, sy, W, H);
 
     HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
                                 loc::T(loc::S::CapPreparing), kStyle, sx, sy, W,

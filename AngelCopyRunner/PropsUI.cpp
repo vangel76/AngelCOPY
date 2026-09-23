@@ -171,6 +171,7 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        theme::SaveWindowPos(hwnd); // shared remembered spot (see Theme.h)
         KillTimer(hwnd, TIMER_REFRESH);
         PostQuitMessage(0);
         return 0;
@@ -199,6 +200,15 @@ void ShowProps(const std::vector<std::wstring>& targets) {
     if (!hwnd) {
         if (SUCCEEDED(comInit)) CoUninitialize();
         return;
+    }
+    {
+        // Move to the shared remembered spot (if still on a live monitor).
+        RECT wr{};
+        GetWindowRect(hwnd, &wr);
+        int px = 0, py = 0;
+        if (theme::LoadWindowPos(px, py, wr.right - wr.left, wr.bottom - wr.top))
+            SetWindowPos(hwnd, nullptr, px, py, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     theme::UiFonts fonts;

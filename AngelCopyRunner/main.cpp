@@ -233,6 +233,10 @@ int wmain(int argc, wchar_t** argv) {
     // matching (SkipSetFor); the native engine reports skips itself. Skipping
     // collection saves ~1M string allocations on a 500k-file re-mirror.
     SetCollectSkipPaths(!UseNativeEngine());
+    // GUI native runs collect the scan's per-file verdicts instead, so the
+    // copy phase consumes them (SetCarriedClasses below) rather than paying
+    // a SECOND round of destination stats. Console runs scan nothing first.
+    SetCollectClasses(!consoleMode && UseNativeEngine());
 
     // Unreal preset (GUI only): a .uproject in a whole-tree source → offer to
     // skip the regenerable cache folders. Decided BEFORE the scan so totals,
@@ -302,6 +306,9 @@ int wmain(int argc, wchar_t** argv) {
         // Space check after confirmation: the purge frees space but runs after
         // the copy, so it can't be counted against the copy's need.
         if (!SpaceOkOrConfirmed(dest, scan, Conflict::Replace)) return 0;
+        // Hand the scan's verdicts to the engine: the copy phase then skips
+        // its second round of destination stats (see SetCarriedClasses).
+        SetCarriedClasses(std::move(scan.classes));
         int code = RunSyncWithUI(jobs, bytes, files, skipped, skipSet, extras);
         return (code >= 8) ? code : 0;
     }
@@ -355,6 +362,9 @@ int wmain(int argc, wchar_t** argv) {
     // paint those stretches green instead of counting them as speed.
     std::unordered_set<std::wstring> skipSet = SkipSetFor(scan, policy);
 
+    // Hand the scan's verdicts to the engine: the copy phase then skips its
+    // second round of destination stats (see SetCarriedClasses).
+    SetCarriedClasses(std::move(scan.classes));
     int code = RunJobsWithUI(op, jobs, bytes, files, policy, skipped, skipSet);
     return (code >= 8) ? code : 0;
 }

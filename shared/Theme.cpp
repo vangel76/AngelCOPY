@@ -206,4 +206,40 @@ void RunModalLoop(HWND hwnd) {
 
 void SetFont(HWND w, HFONT f) { SendMessageW(w, WM_SETFONT, (WPARAM)f, TRUE); }
 
+bool LoadWindowPos(int& x, int& y, int w, int h) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AngelCOPY", 0, KEY_READ,
+                      &k) != ERROR_SUCCESS)
+        return false;
+    DWORD vx = 0, vy = 0, cb = sizeof(DWORD), type = 0;
+    bool ok =
+        RegQueryValueExW(k, L"WindowX", nullptr, &type, (BYTE*)&vx, &cb) ==
+            ERROR_SUCCESS && type == REG_DWORD &&
+        (cb = sizeof(DWORD),
+         RegQueryValueExW(k, L"WindowY", nullptr, &type, (BYTE*)&vy, &cb) ==
+             ERROR_SUCCESS) && type == REG_DWORD;
+    RegCloseKey(k);
+    if (!ok) return false;
+    x = (int)(LONG)vx;
+    y = (int)(LONG)vy;
+    // The saved point must still land on a live monitor — a remembered spot
+    // on an unplugged screen would open the window invisibly off-desktop.
+    RECT r{x, y, x + w, y + h};
+    return MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
+}
+
+void SaveWindowPos(HWND hwnd) {
+    RECT r{};
+    if (!GetWindowRect(hwnd, &r)) return;
+    if (IsIconic(hwnd)) return; // minimized coords are (-32000,-32000) junk
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\AngelCOPY", 0, nullptr,
+                        0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD vx = (DWORD)(LONG)r.left, vy = (DWORD)(LONG)r.top;
+    RegSetValueExW(k, L"WindowX", 0, REG_DWORD, (const BYTE*)&vx, sizeof(vx));
+    RegSetValueExW(k, L"WindowY", 0, REG_DWORD, (const BYTE*)&vy, sizeof(vy));
+    RegCloseKey(k);
+}
+
 } // namespace theme

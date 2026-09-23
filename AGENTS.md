@@ -1,4 +1,4 @@
-# CLAUDE.md — AngelCOPY
+# AGENTS.md — AngelCOPY
 
 Guidance for working in this repo.
 
@@ -242,22 +242,11 @@ build.bat                                             REM -> dist\*.dll, *.exe
   enumerated, and skips advance the green bar during the walk. The first
   version collected the whole plan before copying — on 500k files the dialog
   sat at 0% for the entire (second) walk. Do not reintroduce a collect-then-
-  execute phase.
-- **The scan's verdicts are CARRIED to the engine** (`SetCarriedClasses` /
-  `ClassifyOrCarried`, Sep 2026): GUI native runs collect per-file classes
-  during the scan (`SetCollectClasses`, lowercased src → FileClass) and the
-  copy pool looks them up instead of re-statting every destination — the
-  second stat round WAS the copy phase on a skip-heavy mirror over a slow
-  target ("warm-cached re-classification is free" only holds locally). Rules:
-  a lookup MISS always falls back to a real `ClassifyFile` (file appeared or
-  changed since the scan — carried verdicts are an optimization, never the
-  only truth); a map over `kMaxCarriedClasses` (400k, ~100 MB) is DISCARDED
-  and the engine re-classifies streamed as before; fast-path Lonely files are
-  not in the map (the engine's `dstFresh` shortcut covers them statlessly);
-  console runs and the robocopy fallback never collect. Regression:
-  `tests\test_native.cpp` "carried scan verdicts" — adversarial: a wrong
-  carried "Same" for a changed file must make the engine SKIP it, proving the
-  carry is consumed rather than re-derived.
+  execute phase. The engine deliberately re-classifies rather than reusing the
+  Preparing scan's results: the scan keeps only aggregates (a 500k-item work
+  list would pin hundreds of MB), decisions must apply to the tree as it is at
+  copy time, and streamed re-classification is warm-cached metadata overlapped
+  with I/O — wall-clock free.
 - **The engine's walk must mirror `ScanTree` exactly** (reparse points skipped,
   same classification via the shared `ClassifyFile`), or the progress totals
   and the conflict prompt drift from what actually happens.

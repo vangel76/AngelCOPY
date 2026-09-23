@@ -4,6 +4,22 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] — 2026-09-23
+
+### Changed
+- **The copy phase of a mirror/re-copy no longer re-checks every file.** The
+  "Preparing" scan already classified everything, but the engine then paid a
+  SECOND round of destination checks during the copy — on a mostly-unchanged
+  mirror over a slow target that second round was the entire copy phase. The
+  scan's per-file verdicts are now handed to the engine and consumed
+  directly; only files that appeared or changed since the scan are re-checked
+  for real. Memory-capped (~400k files, above that the old behavior);
+  covered by an adversarial regression test.
+- **AngelCOPY windows remember their position.** Transfer, Preparing and
+  Properties windows reopen at the spot they were last closed (shared,
+  per-user; falls back to centered when the saved spot is no longer on a
+  live monitor). Confirmation dialogs stay centered on purpose.
+
 ## [1.5.0] — 2026-09-10
 
 ### Removed

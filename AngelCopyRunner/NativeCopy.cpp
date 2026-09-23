@@ -88,6 +88,21 @@ bool PolicySkips(Conflict policy, FileClass fc) {
     return !PolicyCopies(policy, fc);
 }
 
+// Carried scan verdict, or a fresh destination stat on a miss. The carry
+// (SetCarriedClasses, Robocopy.h) removes the copy phase's SECOND round of
+// destination stats — on a skip-heavy mirror over a slow target those
+// re-stats were the entire copy phase. A miss (file appeared or the map was
+// discarded over the memory cap) stats for real, so carried verdicts are
+// an optimization, never the only truth.
+FileClass ClassifyOrCarried(const std::wstring& src, const std::wstring& dst,
+                            unsigned long long size, const FILETIME& mtime) {
+    FileClass fc = FileClass::Lonely; // overwritten on a lookup hit (C4701)
+    if (AnyCarriedClasses() && LookupCarriedClass(acutil::LowerCopy(src), fc))
+        return fc;
+    unsigned long long dstSize = 0;
+    return ClassifyFile(dst, size, mtime, dstSize);
+}
+
 struct Item {
     std::wstring src, dst;
     unsigned long long size = 0;
@@ -182,11 +197,10 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
                 if (size >= kBigFileBytes) {
                     // Big files are rare: classify inline (they must be routed
                     // to the ring here, a worker can't do that).
-                    unsigned long long dstSize = 0;
                     FileClass fc = dstFresh
                                        ? FileClass::Lonely
-                                       : ClassifyFile(it.dst, size,
-                                                      fd.ftLastWriteTime, dstSize);
+                                       : ClassifyOrCarried(it.src, it.dst, size,
+                                                           fd.ftLastWriteTime);
                     if (PolicySkips(policy, fc)) {
                         if (sink.onSkip) sink.onSkip(it.src, it.size);
                     } else {
@@ -670,9 +684,9 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                                 // Deferred dest stat (see WalkStream): decide
                                 // skip-vs-copy here so 16 workers share the
                                 // stat cost instead of the walk thread alone.
-                                unsigned long long dstSize = 0;
-                                FileClass fc = ClassifyFile(it.dst, it.size,
-                                                            it.mtime, dstSize);
+                                // Carried scan verdicts skip the stat entirely.
+                                FileClass fc = ClassifyOrCarried(
+                                    it.src, it.dst, it.size, it.mtime);
                                 if (PolicySkips(policy, fc)) {
                                     if (sink.onSkip) sink.onSkip(it.src, it.size);
                                     continue;
@@ -720,8 +734,8 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                     continue; // vanished since planning; scan skipped it too
                 unsigned long long size =
                     ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-                unsigned long long dstSize = 0;
-                FileClass fc = ClassifyFile(dst, size, fa.ftLastWriteTime, dstSize);
+                FileClass fc =
+                    ClassifyOrCarried(src, dst, size, fa.ftLastWriteTime);
                 Item it{std::move(src), std::move(dst), size};
                 if (PolicySkips(policy, fc))    plan.skips.push_back(std::move(it));
                 else if (size >= kBigFileBytes) plan.big.push_back(std::move(it));

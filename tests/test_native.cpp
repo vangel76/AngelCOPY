@@ -8,6 +8,7 @@
 //      ..\AngelCopyRunner\NativeCopy.cpp ..\AngelCopyRunner\Robocopy.cpp ^
 //      Shlwapi.lib
 #include "../AngelCopyRunner/NativeCopy.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <atomic>
@@ -562,6 +563,54 @@ static void TestExcludeDirs() {
     RmTree(base);
 }
 
+// Carried scan verdicts (SetCarriedClasses): the engine must CONSUME them —
+// proven adversarially with a deliberately WRONG "Same" verdict for a changed
+// file: consuming the carry skips it, re-statting would copy it. A lookup
+// miss must fall back to a real classification, and an over-cap map must be
+// discarded.
+static void TestCarriedClasses() {
+    printf("carried scan verdicts:\n");
+    std::wstring base = g_root + L"\\carry";
+    RmTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+    CreateDirectoryW((base + L"\\dest").c_str(), nullptr);
+    CreateDirectoryW((base + L"\\dest\\src").c_str(), nullptr);
+
+    // Both files differ at the destination — Replace would copy both.
+    WriteFileText(base + L"\\dest\\src\\changed.txt", "DEST-OLD", -10);
+    WriteFileText(base + L"\\src\\changed.txt", "SRC-NEW", 0);
+    WriteFileText(base + L"\\dest\\src\\missfile.txt", "DEST-OLD", -10);
+    WriteFileText(base + L"\\src\\missfile.txt", "SRC-NEW", 0);
+
+    std::vector<std::wstring> sources{base + L"\\src"};
+    auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
+
+    std::unordered_map<std::wstring, FileClass> m;
+    m[acutil::LowerCopy(base + L"\\src\\changed.txt")] = FileClass::Same;
+    SetCarriedClasses(std::move(m));
+
+    Counts c;
+    RunNativeJobs(Operation::Copy, jobs, Conflict::Replace, c.Sink());
+    check(ReadText(base + L"\\dest\\src\\changed.txt") == "DEST-OLD",
+          "  carried verdict consumed (engine skipped per the carry)");
+    check(ReadText(base + L"\\dest\\src\\missfile.txt") == "SRC-NEW",
+          "  lookup miss fell back to a real classification (copied)");
+    check(c.skips.load() == 1, "  exactly the carried file counted as a skip");
+    check(c.errors.load() == 0, "  no errors");
+
+    // A map over the memory cap must be discarded entirely.
+    std::unordered_map<std::wstring, FileClass> big;
+    big.reserve(kMaxCarriedClasses + 2);
+    for (size_t i = 0; i <= kMaxCarriedClasses; ++i)
+        big.emplace(L"k" + std::to_wstring(i), FileClass::Same);
+    SetCarriedClasses(std::move(big));
+    check(!AnyCarriedClasses(), "  over-cap map discarded (memory cap)");
+
+    SetCarriedClasses({}); // reset for anything that runs after this test
+    RmTree(base);
+}
+
 int wmain() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -582,6 +631,7 @@ int wmain() {
     TestSameFolderCopy();
     TestLongPaths();
     TestExcludeDirs();
+    TestCarriedClasses();
 
     RmTree(g_root);
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

@@ -75,4 +75,12 @@ void RunModalLoop(HWND hwnd);
 
 void SetFont(HWND w, HFONT f);
 
+// Remembered top-left position for the working windows (progress, preparing,
+// properties) — they used to pop up centered on the primary monitor every
+// time. One shared point (HKCU\Software\AngelCOPY, WindowX/WindowY), saved on
+// close, ignored when the saved point no longer hits a live monitor
+// (unplugged screen). Confirmation dialogs stay centered on purpose.
+bool LoadWindowPos(int& x, int& y, int w, int h);
+void SaveWindowPos(HWND hwnd);
+
 } // namespace theme
