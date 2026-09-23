@@ -761,16 +761,8 @@ bool TryQuickRenameMove(const RoboJob& job) {
                        0) != 0;
 }
 
-bool UseNativeEngine() {
-    wchar_t buf[32];
-    DWORD n = GetEnvironmentVariableW(L"ANGELCOPY_ENGINE", buf, 32);
-    return !(n && n < 32 && _wcsicmp(buf, L"robocopy") == 0);
-}
-
 int RunJobsConsole(Operation op, const std::vector<RoboJob>& jobs,
                    Conflict policy) {
-    if (!UseNativeEngine()) return RunJobs(op, jobs, policy);
-
     std::mutex m;
     CopySink sink;
     sink.onError = [&m](const std::wstring& msg) {

@@ -5,8 +5,11 @@ Guidance for working in this repo.
 ## What this is
 
 A Windows shell extension that replaces Explorer's slow single-threaded copy
-with a native Win32 copy engine (`NativeCopy.cpp`; robocopy remains as an A/B
-fallback via `ANGELCOPY_ENGINE=robocopy`). Nothing is invisible — Windows offers no supported hook
+with a native Win32 copy engine (`NativeCopy.cpp`). The robocopy execution
+path (the old A/B fallback, `ANGELCOPY_ENGINE=robocopy`) was REMOVED Sep 2026
+once the engine was declared done; `bench\bench.cpp` still measures against
+robocopy.exe directly, and the planning/scan layer keeps its historic file
+name `Robocopy.cpp`. Nothing is invisible — Windows offers no supported hook
 for Ctrl+V or a left drag (see gotchas). Integration is a **right-drag** menu
 (Copy/Move here FAST) plus right-click **Copy / Paste / Delete FAST**. Native
 dialogs show progress, conflicts and confirmation. Personal-use, unsigned, x64.
@@ -26,8 +29,9 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **COM smoke test (no registry/Explorer):** compile & run `tests\test_load.cpp`
   against `dist\AngelCopyShell.dll` — loads the DLL, exercises both class
   objects and every interface. Use this to validate the DLL without registering.
-- **Conflict / mirror unit tests:** `tests\test_conflict.cpp` (policy → flags,
-  scan classification, skip sets, real robocopy outcomes) and `tests\test_sync.cpp`
+- **Conflict / mirror unit tests:** `tests\test_conflict.cpp` (scan
+  classification, the PolicyCopies predicate, overwrite-growth space
+  accounting) and `tests\test_sync.cpp`
   (`ScanExtras`: lonely dest entries, type mismatches, loose-file jobs never
   purge). Compile each with `Robocopy.cpp` + `Shlwapi.lib`, run, expect ALL PASS.
 - **Native engine unit tests:** `tests\test_native.cpp` (policy matrix on real
@@ -66,7 +70,7 @@ build.bat                                             REM -> dist\*.dll, *.exe
     deliberately NO "Copy FAST": it only filled the clipboard — byte-identical
     to Ctrl+C — and the speed lives entirely in the paste. Removed July 2026;
     don't bring it back. Native Ctrl+C/X + Paste FAST is the workflow (Ctrl+X
-    makes it a robocopy move via the clipboard's PreferredDropEffect).
+    makes it a move via the clipboard's PreferredDropEffect).
   - `Register.cpp` — `DllRegisterServer`/`Unregister`: the CLSIDs plus the
     `DragDropHandlers` / `ContextMenuHandlers` keys. Also `CleanupLegacyDropHandler`,
     which strips the dead DropHandler keys (and the bogus `{BB2E617C-...}`
@@ -76,27 +80,25 @@ build.bat                                             REM -> dist\*.dll, *.exe
   - `Guids.cpp`, `dllmain.cpp` (factory + exports), `AngelCopyShell.def`.
 - `AngelCopyRunner/` — x64 console-subsystem exe. The worker; separate process
   so a hang/crash never destabilizes Explorer.
-  - `NativeCopy.cpp` — **the copy engine** (July 2026; replaced robocopy
-    execution, planning/scan layer unchanged). Small files: `CopyFileExW`
-    thread pool, one thread per directory in 256-file chunks, 16 threads.
-    Big files (>= 32 MiB): unbuffered overlapped ring, QD8 x 8 MiB over an
-    IOCP. Moves: attempt `MoveFileExW` first (whole-tree rename when the
-    destination is absent; per-file otherwise), copy+delete only on
+  - `NativeCopy.cpp` — **the copy engine** (July 2026). Small files:
+    `CopyFileExW` thread pool, one thread per directory in 256-file chunks,
+    16 threads. Big files (>= 32 MiB): unbuffered overlapped ring, QD8 x
+    8 MiB over an IOCP. Moves: attempt `MoveFileExW` first (whole-tree rename
+    when the destination is absent; per-file otherwise), copy+delete only on
     `ERROR_NOT_SAME_DEVICE`. Progress/skips/errors via `CopySink` callbacks.
-    Semantics parity with the old flags: /E, /COPY:DAT, /R:2 /W:2, /XJ.
-    `ANGELCOPY_ENGINE=robocopy` selects the old path; `ANGELCOPY_THREADS`
-    overrides the pool size for future measurements (e.g. SMB).
-  - `Robocopy.cpp` — `PlanJobs` (dirs → whole-tree jobs; loose files grouped by
-    parent dir), `BuildRobocopyArgs` (`parseable` toggles the machine-readable
-    flag set; `Conflict` policy adds `/XO` etc.), `ScanJobs` (classifies every
-    file vs. the destination: lonely/same/newer/older), `ClassifyFile` (public:
-    the native engine must decide exactly like the scan), `ExpectedFor`,
-    console `RunJobs` (fallback engine).
-  - `ProgressUI.cpp` — native Win32 dialog + worker thread that spawns robocopy
-    with a redirected pipe and parses output.
+    Semantics parity with the old robocopy flags: /E, /COPY:DAT, /R:2 /W:2,
+    /XJ. `ANGELCOPY_THREADS` overrides the pool size for measurements.
+  - `Robocopy.cpp` — historic name; today the PLANNING/SCAN layer only:
+    `PlanJobs` (dirs → whole-tree jobs; loose files grouped by parent dir),
+    `ScanJobs` (classifies every file vs. the destination:
+    lonely/same/newer/older), `ClassifyFile` (public: the engine must decide
+    exactly like the scan), `PolicyCopies`, `ExpectedFor`, exclusions, the
+    carried-verdict store.
+  - `ProgressUI.cpp` — native Win32 dialog + worker thread driving the engine
+    via `CopySink` callbacks.
   - `ConflictUI.cpp` — pre-transfer conflict prompt (Replace / Only if newer /
     Skip / Cancel). `ConfirmUI.cpp` — the mandatory delete confirmation.
-  - `Delete.cpp` — own recursive deleter (no robocopy; see gotchas). Also
+  - `Delete.cpp` — own recursive deleter (see gotchas). Also
     holds `ScanDelete` (files/dirs/bytes, feeds the delete prompt AND the
     properties dialog) on the `ScanWork`/`DrainScanWork` 8-worker queue.
   - `PropsUI.cpp` — fast properties dialog (`props` op; Alt+Enter /
@@ -134,9 +136,8 @@ build.bat                                             REM -> dist\*.dll, *.exe
       (`ScanTree`, `WalkStream`) AND the purge walk (`FindExtras`) — if the
       purge saw it, it would delete the very cache the user kept, because the
       copy never wrote it so it reads as "not in source". The check goes BEFORE
-      the recursion in all three. Robocopy fallback emits `/XD` (from the
-      ACTUAL set via `ExcludedDirNames()`, not the Unreal constant). Console
-      never excludes. **The whole-tree rename fast paths refuse when
+      the recursion in all three. Console never excludes.
+      **The whole-tree rename fast paths refuse when
       exclusions are active** (`TryQuickRenameMove` AND `TryRenameTree`): a
       rename would move the excluded caches along, silently ignoring the
       user's checkbox — the per-file path is the only one that can honor it.
@@ -150,7 +151,6 @@ build.bat                                             REM -> dist\*.dll, *.exe
     `RoboJob::dstNames[i]` set. A same-folder MOVE is dropped as a no-op (never
     self-destruct). `copyWord` ("Kopie"/"Copy") is passed INTO PlanJobs so
     Robocopy.cpp keeps no Localize dependency (the unit tests don't link it).
-    The robocopy fallback engine can't rename per file, so this is native-only.
   - `main.cpp` — arg parse, `--console` vs GUI dispatch, scan → prompt → run.
 - `AngelCopyAgent/` — x64 Windows-subsystem tray exe: the Ctrl+V interceptor
   (see the Ctrl+V gotcha below for the design laws). Compiles
@@ -254,7 +254,7 @@ build.bat                                             REM -> dist\*.dll, *.exe
   only truth); a map over `kMaxCarriedClasses` (400k, ~100 MB) is DISCARDED
   and the engine re-classifies streamed as before; fast-path Lonely files are
   not in the map (the engine's `dstFresh` shortcut covers them statlessly);
-  console runs and the robocopy fallback never collect. Regression:
+  console runs never collect. Regression:
   `tests\test_native.cpp` "carried scan verdicts" — adversarial: a wrong
   carried "Same" for a changed file must make the engine SKIP it, proving the
   carry is consumed rather than re-derived.
@@ -375,28 +375,22 @@ build.bat                                             REM -> dist\*.dll, *.exe
   uninstall as a "restore", i.e. pure junk. If a handler key did not exist before
   us, uninstall must DELETE it, not write a guessed value back.
 
-- **robocopy `/MT` parallelizes per-file, never splits one file.** 64 threads
-  only materialize with many files (verified: 400 files → 68 threads; 1 big file
-  → 5). A single huge file therefore cannot be sped up with threads at all — its
-  rate is simply the disk's (~500 MB/s cold here). Don't "fix" that.
-- **Do NOT add HDD detection to throttle `/MT`.** It sounds obvious (spinning
-  disks hate parallel streams) and the mechanism exists —
+- **A single huge file cannot be sped up with threads** — parallelism is
+  per-file (verified back in the robocopy days: 1 big file materialized only
+  5 of 64 threads); its rate is simply the disk's. Don't "fix" that.
+- **Do NOT add HDD detection to throttle thread counts.** It sounds obvious
+  (spinning disks hate parallel streams) and the mechanism exists —
   `IOCTL_STORAGE_QUERY_PROPERTY` / `StorageDeviceSeekPenaltyProperty`. It was
   rejected because **this machine has no HDD** (three SSDs: 2×NVMe + 1×SATA), so
   the *benefit* cannot be measured at all — only the detection could. Shipping an
   unmeasured heuristic is exactly what produced the dead DropHandler and the
   `/MIR` delete myth. A false positive (SSD behind a controller reporting a seek
   penalty) would throttle a fast array for nothing. If an HDD ever shows up:
-  measure `/MT:64` vs `/MT:8` vs `/MT:2` on it first, then decide.
-- **`/J` (unbuffered I/O) is deliberately NOT used.** Measured on a cold 8 GB
-  file: 491 MB/s buffered vs 550 MB/s with `/J` — ~12% from a single sample, and
-  it hurts many-small-file jobs. The user judged that not worth the branch.
-  Beware: the *first* such measurement showed 3165 MB/s buffered because the
-  source was still in the page cache — a warm-cache run measures nothing.
-- **Never use robocopy to delete.** Measured: `/MIR` empty-mirror with `/MT:64`
-  (908 ms) == `/MT:1` (919 ms) — robocopy does not parallelize its purge phase,
-  and plain `rm -rf` (792 ms) beats both. The ~3x win over Explorer is purely
-  from skipping shell overhead (SHFileOperation 1836 ms vs ours 580 ms).
+  measure the thread sweep on it first, then decide.
+- **Deletion is its own engine, never a copy tool's side effect.** (Historic:
+  robocopy's `/MIR` "fast delete" was measured a myth — it never parallelized
+  its purge; plain `rd /s` beat it. The ~3x win over Explorer comes from
+  skipping shell overhead.)
   - **`Delete.cpp` IS the dir-sharded 8-thread pool** (July 2026): streaming
     walk feeds one directory's files per 256-file chunk to 8 workers, real
     directories are removed bottom-up afterwards, reparse points are removed
@@ -466,88 +460,54 @@ build.bat                                             REM -> dist\*.dll, *.exe
   ("D:\") otherwise becomes `"D:\"`, whose `\"` is an escaped quote that merges
   the following @list argument in. Source paths still go through the temp list
   file, never the command line (no filename injection possible).
-- **Byte progress comes from `GetProcessIoCounters`, NOT from robocopy's output.**
-  robocopy's stdout is a pipe, so its CRT buffers in 4 KB blocks: one huge file
-  emits ~100 bytes of text and we receive *nothing* until the process exits — the
-  dialog sat at 0 B / 0 B/s for an entire 8 GB copy (measured). Polling the
-  destination file size does not help: robocopy pre-allocates it to full size
-  instantly. The process's own IO counters are live regardless (verified: 1959 →
-  3990 → 5988 → 8183 MB on that same file). Counters are per-process, so each
-  finished job's `WriteTransferCount` is banked into `ioCompleted` *before* the
-  handle is closed, and the running job's is added on top.
-  - `Shared::bytesFromIo` gates this: the robocopy path sets it (and then
-    `FeedChunk` must NOT also add file-line sizes — double counting); the delete
-    path has no child process and keeps reporting bytes directly.
-  - File count and current file name still come from the parsed output, so a
-    single big file shows "0/1" until the end. Bytes are the useful signal.
-- **`%` lines are useless under `/MT`** — they interleave across threads and
-  can't be attributed to a file. `/NP` suppresses them. Parseable flags:
-  `/BYTES /FP /NC /NDL /NJH /NJS /NP`.
-- **Free-space warning uses OVERWRITE GROWTH, not source size.** robocopy
-  overwrites in-place (measured: 2 GB source over a 500 MB destination consumes
-  ~1.5 GB, and the free-space dip equals the net, never the full 2 GB — no temp
-  sidecar). So `NeededSpaceFor` = lonely bytes (full) + Σ max(0, srcSize −
-  dstSize) over the classes the policy copies. Shrinking files add zero and are
-  never counted as freed (/MT ordering is unknown — never wrong in the
-  dangerous direction). The naive "source size vs free" check would false-alarm
-  on every re-copy of an existing tree; don't reintroduce it.
+- **Free-space warning uses OVERWRITE GROWTH, not source size.** Overwrites
+  happen in-place (measured: a 2 GB source over a 500 MB destination consumes
+  ~1.5 GB — the dip equals the net, never the full 2 GB; no temp sidecar). So
+  `NeededSpaceFor` = lonely bytes (full) + Σ max(0, srcSize − dstSize) over
+  the classes the policy copies. Shrinking files add zero and are never
+  counted as freed (copy ordering is unknown — never wrong in the dangerous
+  direction). The naive "source size vs free" check would false-alarm on
+  every re-copy of an existing tree; don't reintroduce it.
   - **Order is load-bearing: conflict prompt first, space check second.** The
     chosen policy decides how much is written ("Skip existing" needs far less
     than "Replace"), so the need isn't known until the policy is picked.
-  - Same-volume move is NOT a rename — robocopy `/MOVE` copies then deletes
-    (measured: a 1 GB same-volume move dips the full 1 GB). So a move needs
-    space exactly like a copy; no special-casing.
+  - A move that falls through to copy+delete needs space exactly like a copy
+    (the rename fast paths never reach the space check); no special-casing.
   - For mirror the purge frees space but runs AFTER the copy, so it can't offset
     the copy's need — the check uses the copy figure only.
   - Advisory, never blocking: compression/dedup/quota can beat the estimate, so
     the dialog offers "Try anyway" (Cancel default). A failed `GetDiskFreeSpace`
     ExW (network share reporting nothing) returns "ok" — fail-open, never block.
     Use `lpFreeBytesAvailableToCaller` (quota-aware), not the volume total.
-- **robocopy's default overwrite is destructive and silent** — it overwrites any
+- **A plain Replace overwrite is destructive and silent** — it overwrites any
   file that differs, *including overwriting a newer destination with an older
-  source*. Hence the conflict prompt (`ConflictUI`) and the `Conflict` policy →
-  flag mapping: Replace = default, Only-if-newer = `/XO`, Skip = `/XC /XN /XO`.
-  Verified end-to-end in `tests\test_conflict.cpp`.
-- **Identical files are never conflicts.** robocopy skips same-size/same-mtime
-  (2s tolerance) files, so counting them would prompt on every re-copy *and*
-  break the bar.
+  source* (robocopy's old default, kept as ours). Hence the conflict prompt
+  (`ConflictUI`) and the `PolicyCopies` mapping, verified in
+  `tests\test_conflict.cpp` and test_native's on-disk policy matrix.
+- **Identical files are never conflicts.** Same-size/same-mtime files (2s
+  tolerance, FAT/network granularity) are skipped, so counting them would
+  prompt on every re-copy *and* break the bar.
 - **Skipped files are visible in the bar (green), but never in the speed.** The
   bar spans expected + skipped volume; skipped stretches are painted green and
   carry no throughput curve. Speed and ETA divide by **copied** bytes only —
   letting skips into the rate is exactly what made the graph "sehr schnell" on
-  half-existing destinations. Mechanics:
-  - `/V` is required in the parseable flag set — without it robocopy does not
-    list skipped files at all. Cost: ~0.17 ms per skipped file, linear
-    (measured: 4000 all-skip 80→880 ms, 12000: 116→2155 ms). Only skips pay it.
-  - With `/NC` a skipped line is **textually identical** to a copy line (the
-    class word — "Gleich"/"Älter" — is localized anyway, don't parse it). The
-    only discriminator is the path: `SkipSetFor(scan, policy)` holds the
-    lowercased source paths robocopy will list but not copy, and it must mirror
-    `SkippedFor` exactly (under Replace, newer/older files ARE copied and must
-    not be in the set). **Only the robocopy fallback consumes this set** — the
-    scan collects the per-file path lists solely when `SetCollectSkipPaths`
-    left collection on (main.cpp turns it off for native runs: the lists were
-    ~1M pinned string allocations per 500k-file re-mirror, feeding nothing).
-  - robocopy also lists **"extra" files** (present only at the destination) as
-    the same line shape — with their *destination* path. Filter lines whose
-    path is under any job's dstDir, or every extra inflates the file counter
-    (this bug existed before /V; extras print regardless).
-  - A transfer that finishes within the first 150 ms sample interval (all-skip
-    re-copy) would never write a chart bucket — completion flushes the pending
-    sample unconditionally, and the first sample fills from bucket 0.
-- **Errors are localized.** Detect the language-neutral `(0xNNNNNNNN)` marker,
-  never the word "ERROR" — German robocopy prints "FEHLER" (this machine).
+  half-existing destinations. The engine reports skips exactly via `onSkip`.
+  A transfer that finishes within the first 150 ms sample interval (all-skip
+  re-copy) would never write a chart bucket — completion flushes the pending
+  sample unconditionally, and the first sample fills from bucket 0.
+- **Error lines carry the language-neutral `(0xNNNNNNNN)` marker**
+  (`ReportError`); the message text is the OS's own localized string. Never
+  match on the word "ERROR" — this machine is German.
 - **WM_TIMER must branch on timer id.** id 1 = refresh, id 2 = auto-close. A
   single `case WM_TIMER` that returns unconditionally swallows the auto-close and
   the dialog hangs open (this bug already happened once — don't reintroduce it).
-- **The speed figure has two failure modes; both were hit.** robocopy prints a
-  file's line when it *starts* the file and `/MT:64` announces many at once, so
-  `doneBytes` advances in bursts: a per-tick rate spikes to nonsense ("4.8
-  GB/s"). But the average since start reads ~half the real rate, because it
-  includes robocopy's startup and directory enumeration where no bytes flow.
-  Correct answer: a sliding ~3s window while copying, whole-transfer average
-  (labelled) once done. Validate against real destination byte growth, not
-  Task Manager — TM counts read+write, so a same-disk copy shows ~2x there.
+- **The speed figure has two failure modes; both were hit.** Byte progress
+  arrives in bursts (many parallel workers), so a per-tick rate spikes to
+  nonsense ("4.8 GB/s"); but the average since start reads too low because it
+  includes enumeration where no bytes flow. Correct answer: a sliding ~3s
+  window while copying, whole-transfer average (labelled) once done. Validate
+  against real destination byte growth, not Task Manager — TM counts
+  read+write, so a same-disk copy shows ~2x there.
 - **The progress lock was never the bottleneck — don't shave it further.**
   Measured Sep 2026 (30k x 1 KiB GUI copy, 5+5 interleaved): all-counters-
   under-one-CS 6964 ms vs lock-free atomics 6957 ms. The atomics stayed
@@ -603,8 +563,9 @@ build.bat                                             REM -> dist\*.dll, *.exe
 - **Double-buffer or it flickers.** `PaintChart` draws into a memory DC and blits
   once; `WM_ERASEBKGND` returns 1. At a 100 ms refresh, painting straight to the
   DC is unusable.
-- **Drawing cannot slow the copy** — robocopy is a *separate process* and the
-  dialog's UI thread is otherwise idle. Don't "optimise" the chart away.
+- **Drawing cannot slow the copy** — the engine runs on its own worker
+  threads and the dialog's UI thread is otherwise idle. Don't "optimise" the
+  chart away.
 - **X axis is PROGRESS, not time.** Each throughput sample goes into the bucket
   for the percentage reached at that moment (`RecordSample`), so the curve's
   right edge *is* the progress position and the axis is fixed at 0..100% of the

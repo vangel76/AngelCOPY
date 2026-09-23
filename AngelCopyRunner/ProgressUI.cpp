@@ -96,35 +96,13 @@ struct Shared {
     // speedup from further lock shaving here — measure first, as ever.
     std::atomic<unsigned long long> doneBytes{0};
     std::atomic<unsigned long long> doneFiles{0};
-    // Bytes robocopy listed but did not copy (identical / policy-excluded).
-    // They advance the bar — painted green — but never the speed or the ETA.
+    // Bytes listed but not copied (identical / policy-excluded). They advance
+    // the bar — painted green — but never the speed or the ETA.
     std::atomic<unsigned long long> skipBytes{0};
     // Throttle for currentFile updates (see MaybeSetName).
     std::atomic<unsigned long long> nameTick{0};
-    // Lowercased source paths the scan says robocopy will skip (SkipSetFor).
-    // /V lists skipped files exactly like copied ones (/NC drops the class
-    // word, which is localized anyway), so the path is the only discriminator.
-    const std::unordered_set<std::wstring>* skipSet = nullptr;
-    // Lowercased destination roots. robocopy also lists files that exist only
-    // at the DESTINATION ("extra" files) and /NC makes those lines identical to
-    // copy lines too — but their paths are under a destination root, ours never
-    // are. Without this filter every extra file inflated the file counter.
-    std::vector<std::wstring> dstPrefixes;
     std::wstring currentFile;
-    std::vector<std::wstring> errors; // robocopy ERROR lines (capped)
-    bool    expectErrDetail = false;  // engine-thread only: next line is detail
-    HANDLE  hCurrentProc = nullptr;   // current robocopy, for cancel + IO counters
-
-    // Byte progress source. robocopy's stdout is a pipe, so its CRT buffers in
-    // 4 KB blocks: a single huge file produces ~100 bytes of output and we
-    // receive NOTHING until the process exits — the dialog sat at 0 B / 0 B/s
-    // for the whole copy (verified with an 8 GB file). Polling the destination
-    // file size does not help either: robocopy pre-allocates it to full size
-    // immediately. So for robocopy we take the bytes from the process's own IO
-    // counters instead, which are live regardless of buffering. The delete path
-    // has no child process and keeps reporting bytes directly.
-    bool    bytesFromIo = false;
-    unsigned long long ioCompleted = 0; // write bytes of already-finished jobs
+    std::vector<std::wstring> errors; // engine error lines (capped)
     // Mirror only: set once the copy phase is done and extras are being
     // deleted. The UI switches its heading; byte progress stays on the copy
     // volume (deletion is metadata work, not transfer).
@@ -148,8 +126,8 @@ struct Shared {
 };
 
 // The dialog is engine-agnostic: it runs whatever worker it is handed, so the
-// copy (robocopy) and delete (own recursive deleter) paths share one window.
-// The worker returns the worst exit code (>=8 == failure, robocopy convention).
+// copy and delete paths share one window. The worker returns the worst exit
+// code (>=8 == failure, the old robocopy convention).
 using Worker = std::function<int(Shared&)>;
 
 struct EngineArgs {
@@ -158,216 +136,10 @@ struct EngineArgs {
     Worker worker;
 };
 
-// ---- output parsing ------------------------------------------------------
-
-std::wstring OemToWide(const char* data, size_t len) {
-    if (len == 0) return L"";
-    int n = MultiByteToWideChar(CP_OEMCP, 0, data, (int)len, nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_OEMCP, 0, data, (int)len, &w[0], n);
-    return w;
-}
-
-bool AllDigits(const std::wstring& s) {
-    if (s.empty()) return false;
-    for (wchar_t c : s) if (c < L'0' || c > L'9') return false;
-    return true;
-}
-
-std::wstring Trim(const std::wstring& s) {
-    size_t a = s.find_first_not_of(L" \t\r\n");
-    if (a == std::wstring::npos) return L"";
-    size_t b = s.find_last_not_of(L" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
-using acutil::LowerCopy;
-
-bool HasPrefix(const std::wstring& s, const std::wstring& prefix) {
-    return s.size() >= prefix.size() &&
-           s.compare(0, prefix.size(), prefix) == 0;
-}
-
-// Parse one robocopy output line. A file line under /BYTES /FP /NC looks like
-// "\t  \t\t<bytes>\t<fullpath>": tab-separated with a pure-digit size field and
-// a path field containing a drive/UNC. Returns true and fills size/path then.
-bool ParseFileLine(const std::wstring& line, unsigned long long& size,
-                   std::wstring& path) {
-    std::vector<std::wstring> fields;
-    size_t start = 0;
-    while (true) {
-        size_t tab = line.find(L'\t', start);
-        std::wstring f =
-            line.substr(start, tab == std::wstring::npos ? std::wstring::npos
-                                                         : tab - start);
-        f = Trim(f);
-        if (!f.empty()) fields.push_back(f);
-        if (tab == std::wstring::npos) break;
-        start = tab + 1;
-    }
-    if (fields.size() < 2) return false;
-
-    const std::wstring& last = fields.back();
-    bool looksPath = last.size() >= 2 &&
-                     ((last[1] == L':') || (last[0] == L'\\' && last[1] == L'\\'));
-    if (!looksPath) return false;
-
-    for (size_t i = 0; i + 1 < fields.size(); ++i) {
-        if (AllDigits(fields[i])) {
-            size = _wcstoui64(fields[i].c_str(), nullptr, 10);
-            path = last;
-            return true;
-        }
-    }
-    return false;
-}
-
-void FeedChunk(Shared* sh, std::string& pending, const char* buf, DWORD n) {
-    pending.append(buf, n);
-    // Split on either CR or LF (robocopy uses CR between percentage updates).
-    size_t pos;
-    while ((pos = pending.find_first_of("\r\n")) != std::string::npos) {
-        std::string raw = pending.substr(0, pos);
-        pending.erase(0, pos + 1);
-        if (raw.empty()) continue;
-        std::wstring line = OemToWide(raw.data(), raw.size());
-
-        unsigned long long size = 0;
-        std::wstring path;
-        if (ParseFileLine(line, size, path)) {
-            std::wstring lower = LowerCopy(path);
-
-            // "Extra" files (present only at the destination) are listed with
-            // their DESTINATION path; robocopy never touches them and neither
-            // must the progress counters.
-            bool isExtra = false;
-            for (const auto& p : sh->dstPrefixes)
-                if (HasPrefix(lower, p)) { isExtra = true; break; }
-            if (isExtra) continue;
-
-            bool isSkip = sh->skipSet && sh->skipSet->count(lower) > 0;
-            if (isSkip) {
-                // Listed but not copied: advances the (green) bar only. Real
-                // bytes keep coming from the IO counters.
-                sh->skipBytes.fetch_add(size, std::memory_order_relaxed);
-            } else if (!sh->bytesFromIo) {
-                // Bytes come from the IO counters when a child process owns
-                // them; adding the line size too would double-count.
-                sh->doneBytes.fetch_add(size, std::memory_order_relaxed);
-            }
-            sh->doneFiles.fetch_add(1, std::memory_order_relaxed);
-            EnterCriticalSection(&sh->cs);
-            sh->currentFile = path;
-            sh->expectErrDetail = false;
-            LeaveCriticalSection(&sh->cs);
-        } else if (line.find(L"(0x") != std::wstring::npos) {
-            // robocopy error line. Detect the Win32 error-code marker "(0x...)"
-            // instead of the word "ERROR" — robocopy is localized (e.g. German
-            // prints "FEHLER"), but the "(0xNNNNNNNN)" code is language-neutral.
-            // Example: "... FEHLER 32 (0x00000020) ... <path>".
-            EnterCriticalSection(&sh->cs);
-            if (sh->errors.size() < 200) sh->errors.push_back(Trim(line));
-            sh->expectErrDetail = true;
-            LeaveCriticalSection(&sh->cs);
-        } else {
-            // The line right after an ERROR is its human description; append it.
-            std::wstring t = Trim(line);
-            EnterCriticalSection(&sh->cs);
-            if (sh->expectErrDetail && !t.empty() && !sh->errors.empty()) {
-                sh->errors.back() += L"  \x2014  " + t;
-                sh->expectErrDetail = false;
-            }
-            LeaveCriticalSection(&sh->cs);
-        }
-        // Percentage lines are suppressed via /NP; nothing else to parse.
-    }
-}
-
 // ---- worker thread -------------------------------------------------------
 
-// Bytes copied so far: finished jobs plus the live counter of the running one.
-// Each job is its own process, so the counters restart per job and have to be
-// accumulated.
 unsigned long long DoneBytes(Shared& sh) {
-    // Native path: one lock-free load. The robocopy path keeps the CS — it is
-    // what keeps hCurrentProc alive across the GetProcessIoCounters call.
-    if (!sh.bytesFromIo) return sh.doneBytes.load(std::memory_order_relaxed);
-    EnterCriticalSection(&sh.cs);
-    unsigned long long total = sh.ioCompleted;
-    IO_COUNTERS ic{};
-    if (sh.hCurrentProc && GetProcessIoCounters(sh.hCurrentProc, &ic))
-        total += ic.WriteTransferCount;
-    LeaveCriticalSection(&sh.cs);
-    return total;
-}
-
-// Worker: drive robocopy over every job, parsing its piped output.
-int RunRobocopyJobs(Shared& shared, Operation op,
-                    const std::vector<RoboJob>& jobs, Conflict policy) {
-    Shared* sh = &shared;
-    std::wstring exe = RobocopyExe();
-    int worst = 0;
-
-    EnterCriticalSection(&sh->cs);
-    sh->bytesFromIo = true; // a child process owns the bytes; see Shared
-    LeaveCriticalSection(&sh->cs);
-
-    for (const RoboJob& job : jobs) {
-        if (InterlockedCompareExchange(&sh->cancel, 0, 0)) break;
-
-        std::wstring args =
-            BuildRobocopyArgs(op, job, /*parseable=*/true, policy);
-        std::wstring cmd = L"\"" + exe + L"\" " + args;
-
-        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-        HANDLE rd = nullptr, wr = nullptr;
-        // 256 KB buffer so robocopy's 64 threads rarely block waiting on us.
-        if (!CreatePipe(&rd, &wr, &sa, 256 * 1024)) { worst = 16; continue; }
-        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = wr;
-        si.hStdError = wr;
-        PROCESS_INFORMATION pi{};
-        std::vector<wchar_t> mut(cmd.begin(), cmd.end());
-        mut.push_back(L'\0');
-
-        BOOL ok = CreateProcessW(exe.c_str(), mut.data(), nullptr, nullptr, TRUE,
-                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-        CloseHandle(wr); // our write end; child owns its copy
-        if (!ok) { CloseHandle(rd); worst = 16; continue; }
-
-        EnterCriticalSection(&sh->cs);
-        sh->hCurrentProc = pi.hProcess;
-        LeaveCriticalSection(&sh->cs);
-
-        std::string pending;
-        char buf[4096];
-        DWORD got = 0;
-        while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0)
-            FeedChunk(sh, pending, buf, got);
-        CloseHandle(rd);
-
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-
-        // Bank this job's final byte count before the handle goes away, then
-        // clear the handle under the lock so the UI never reads a closed one.
-        EnterCriticalSection(&sh->cs);
-        IO_COUNTERS ic{};
-        if (GetProcessIoCounters(pi.hProcess, &ic))
-            sh->ioCompleted += ic.WriteTransferCount;
-        sh->hCurrentProc = nullptr;
-        LeaveCriticalSection(&sh->cs);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-
-        if ((int)code > worst) worst = (int)code;
-    }
-    return worst;
+    return sh.doneBytes.load(std::memory_order_relaxed);
 }
 
 // The UI samples currentFile at 10 Hz; copying the path under the lock for
@@ -385,11 +157,10 @@ void MaybeSetName(Shared& sh, const std::wstring& p) {
     LeaveCriticalSection(&sh.cs);
 }
 
-// Worker: the native engine, feeding Shared directly. No child process, so no
-// IO-counter detour (bytesFromIo stays false), no pipe parsing, no skip-set
-// path matching — the engine reports bytes, files, skips and errors exactly.
-int RunNativeUiJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
-                    Conflict policy) {
+// Worker: the engine, feeding Shared directly — bytes, files, skips and
+// errors are reported exactly via callbacks.
+int RunCopyJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
+                Conflict policy) {
     CopySink sink;
     sink.onBytes = [&sh](unsigned long long d) {
         sh.doneBytes.fetch_add(d, std::memory_order_relaxed);
@@ -414,15 +185,8 @@ int RunNativeUiJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
     return RunNativeJobs(op, jobs, policy, sink);
 }
 
-// Copy worker dispatch: native engine unless ANGELCOPY_ENGINE=robocopy.
-int RunCopyJobs(Shared& sh, Operation op, const std::vector<RoboJob>& jobs,
-                Conflict policy) {
-    return UseNativeEngine() ? RunNativeUiJobs(sh, op, jobs, policy)
-                             : RunRobocopyJobs(sh, op, jobs, policy);
-}
-
-// Worker: permanent recursive delete, reporting into the same Shared state the
-// robocopy path uses, so the dialog shows progress and errors identically.
+// Worker: permanent recursive delete, reporting into the same Shared state
+// the copy path uses, so the dialog shows progress and errors identically.
 int RunDelete(Shared& sh, const std::vector<std::wstring>& targets) {
     DeleteSink sink;
     sink.onFile = [&sh](const std::wstring& path, unsigned long long size) {
@@ -1086,11 +850,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (ui && LOWORD(wp) == IDCANCEL) {
             if (ui->done) { DestroyWindow(hwnd); return 0; }
-            // Request cancel: kill the running robocopy.
+            // Request cancel: the engine's cancelled() callback picks it up.
             InterlockedExchange(&ui->sh->cancel, 1);
-            EnterCriticalSection(&ui->sh->cs);
-            if (ui->sh->hCurrentProc) TerminateProcess(ui->sh->hCurrentProc, 1);
-            LeaveCriticalSection(&ui->sh->cs);
             EnableWindow(ui->btnCancel, FALSE);
             SetWindowTextW(ui->lblTitle, loc::T(loc::S::TitleCancelling));
         }
@@ -1181,26 +942,20 @@ void SendDoneBalloon(const std::wstring& body) {
 
 // Show the dialog and run `worker` on a background thread until it finishes or
 // the user cancels. Shared by the copy and delete paths.
-// `skipSet`/`dstPrefixes` may be null/empty (the delete path has no robocopy
-// output to classify).
 int RunUI(const std::wstring& caption, const std::wstring& heading,
           unsigned long long expectedBytes, unsigned long long expectedFiles,
-          Conflict policy, SkipInfo skipped,
-          const std::unordered_set<std::wstring>* skipSet,
-          std::vector<std::wstring> dstPrefixes, Worker worker,
+          Conflict policy, SkipInfo skipped, Worker worker,
           bool deleteMode = false, std::vector<wchar_t> volumes = {}) {
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
     Shared sh;
-    // The bar spans everything robocopy will walk over — copied AND skipped —
-    // so a half-existing destination doesn't race through a tiny remainder.
+    // The bar spans everything the engine will walk over — copied AND skipped
+    // — so a half-existing destination doesn't race through a tiny remainder.
     // Speed/ETA stay scaled to the real (copied) volume.
     sh.totalBytes = expectedBytes + skipped.identicalBytes + skipped.policyBytes;
     sh.totalRealBytes = expectedBytes;
     sh.totalFiles = expectedFiles + skipped.identicalFiles + skipped.policyFiles;
-    sh.skipSet = skipSet;
-    sh.dstPrefixes = std::move(dstPrefixes);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
     WNDCLASSW wc{};
@@ -1557,28 +1312,14 @@ static std::vector<std::wstring> AllJobPaths(const std::vector<RoboJob>& jobs) {
     return paths;
 }
 
-// Destination roots, lowercased, to filter robocopy's "extra file" lines
-// (they carry destination paths; copy/skip lines carry source paths).
-static std::vector<std::wstring> DstPrefixesFor(const std::vector<RoboJob>& jobs) {
-    std::vector<std::wstring> dstPrefixes;
-    for (const RoboJob& job : jobs) {
-        std::wstring p = LowerCopy(job.dstDir);
-        if (!p.empty() && p.back() != L'\\') p += L'\\';
-        dstPrefixes.push_back(std::move(p));
-    }
-    return dstPrefixes;
-}
-
 int RunJobsWithUI(Operation op, const std::vector<RoboJob>& jobs,
                   unsigned long long expectedBytes,
                   unsigned long long expectedFiles, Conflict policy,
-                  SkipInfo skipped,
-                  const std::unordered_set<std::wstring>& skipSet) {
+                  SkipInfo skipped) {
     const bool move = (op == Operation::Move);
     return RunUI(loc::T(move ? loc::S::CapMoving : loc::S::CapCopying),
                  loc::T(move ? loc::S::HeadMoving : loc::S::HeadCopying),
-                 expectedBytes, expectedFiles, policy, skipped, &skipSet,
-                 DstPrefixesFor(jobs),
+                 expectedBytes, expectedFiles, policy, skipped,
                  [op, &jobs, policy](Shared& sh) {
                      return RunCopyJobs(sh, op, jobs, policy);
                  },
@@ -1590,7 +1331,6 @@ int RunDeleteWithUI(const std::vector<std::wstring>& targets,
                     unsigned long long expectedFiles) {
     return RunUI(loc::T(loc::S::CapDeleting), loc::T(loc::S::HeadDeleting),
                  expectedBytes, expectedFiles, Conflict::Replace, SkipInfo{},
-                 nullptr, {},
                  [&targets](Shared& sh) { return RunDelete(sh, targets); },
                  /*deleteMode=*/true, VolumesForPaths(targets));
 }
@@ -1598,14 +1338,12 @@ int RunDeleteWithUI(const std::vector<std::wstring>& targets,
 int RunSyncWithUI(const std::vector<RoboJob>& jobs,
                   unsigned long long expectedBytes,
                   unsigned long long expectedFiles, SkipInfo skipped,
-                  const std::unordered_set<std::wstring>& skipSet,
                   const std::vector<std::wstring>& extraTargets) {
     // Copy first, then purge: never delete anything while the copy that might
     // still fail is running. A cancel between the phases leaves a superset of
     // the source at the destination — safe.
     return RunUI(loc::T(loc::S::CapSyncing), loc::T(loc::S::HeadSyncing),
                  expectedBytes, expectedFiles, Conflict::Replace, skipped,
-                 &skipSet, DstPrefixesFor(jobs),
                  [&jobs, &extraTargets](Shared& sh) {
                      int rc = RunCopyJobs(sh, Operation::Copy, jobs,
                                           Conflict::Replace);

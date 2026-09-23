@@ -4,10 +4,12 @@
 
 namespace angelcopy {
 
-// Native copy engine — replaces robocopy *execution* while keeping the
-// planning/scanning layer (PlanJobs, ScanJobs, policies) unchanged. Semantics
-// mirror the flags BuildRobocopyArgs used: /E (empty dirs too), /COPY:DAT,
-// /R:2 /W:2, /XJ (reparse points skipped), policy classes per ClassifyFile.
+// THE copy engine. Grew out of replacing robocopy's execution while keeping
+// its planning/scanning layer; semantics still mirror the old flag set:
+// /E (empty dirs too), /COPY:DAT, /R:2 /W:2, /XJ (reparse points skipped),
+// policy classes per ClassifyFile. (The robocopy execution path itself was
+// removed in Sep 2026 — bench\bench.cpp still measures against robocopy.exe
+// directly.)
 //
 // Why it exists (measured, bench/bench.cpp, July 2026, NVMe):
 //   small files: CopyFileW pool, one thread per directory (256-file chunks so
@@ -37,14 +39,9 @@ struct CopySink {
 int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                   Conflict policy, const CopySink& sink);
 
-// Console-mode dispatcher: native engine by default, robocopy when
-// ANGELCOPY_ENGINE=robocopy. Prints per-job lines + errors like RunJobs.
+// Console-mode wrapper: per-job lines + errors to the console.
 int RunJobsConsole(Operation op, const std::vector<RoboJob>& jobs,
                    Conflict policy);
-
-// False only when ANGELCOPY_ENGINE=robocopy is set (A/B fallback during
-// burn-in; the robocopy path stays intact behind it).
-bool UseNativeEngine();
 
 // GUI fast path, tried BEFORE any scan or window: a whole-tree move whose
 // destination does not exist cannot conflict with anything, and on the same

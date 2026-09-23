@@ -4,7 +4,7 @@
 ; ===========================================================================
 
 #define AppName    "AngelCOPY"
-#define AppVersion "1.5.1"
+#define AppVersion "1.5.2"
 
 [Setup]
 AppId={{7F3A9C21-1B4E-4C8A-9E2D-4A1F6B0C0D00}

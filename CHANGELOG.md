@@ -4,6 +4,19 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] — 2026-09-23
+
+### Removed
+- **The robocopy execution path.** The engine has been the default since
+  July 2026 and was declared done; the A/B fallback
+  (`ANGELCOPY_ENGINE=robocopy`), its pipe parser, IO-counter progress detour,
+  skip-set line matching and the `/XD`/flag builder are gone (~600 lines).
+  The planning/scan layer (PlanJobs/ScanJobs/ClassifyFile — historic file
+  name `Robocopy.cpp`) is unchanged, `bench\bench.cpp` still benchmarks
+  against robocopy.exe directly, and the conflict-policy semantics stay
+  verified by the test suites (on-disk outcomes via the native policy
+  matrix).
+
 ## [1.5.1] — 2026-09-23
 
 ### Changed

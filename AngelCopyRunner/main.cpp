@@ -229,14 +229,10 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<RoboJob> jobs =
         PlanJobs(op, dest, sources, loc::T(loc::S::CopyWord));
 
-    // The per-file skip-path lists feed only the robocopy fallback's output
-    // matching (SkipSetFor); the native engine reports skips itself. Skipping
-    // collection saves ~1M string allocations on a 500k-file re-mirror.
-    SetCollectSkipPaths(!UseNativeEngine());
-    // GUI native runs collect the scan's per-file verdicts instead, so the
-    // copy phase consumes them (SetCarriedClasses below) rather than paying
-    // a SECOND round of destination stats. Console runs scan nothing first.
-    SetCollectClasses(!consoleMode && UseNativeEngine());
+    // GUI runs collect the scan's per-file verdicts, so the copy phase
+    // consumes them (SetCarriedClasses below) rather than paying a SECOND
+    // round of destination stats. Console runs scan nothing first.
+    SetCollectClasses(!consoleMode);
 
     // Unreal preset (GUI only): a .uproject in a whole-tree source → offer to
     // skip the regenerable cache folders. Decided BEFORE the scan so totals,
@@ -299,8 +295,6 @@ int wmain(int argc, wchar_t** argv) {
         // the confirmation below states it instead.
         ExpectedFor(scan, Conflict::Replace, bytes, files);
         SkipInfo skipped = SkippedFor(scan, Conflict::Replace);
-        std::unordered_set<std::wstring> skipSet =
-            SkipSetFor(scan, Conflict::Replace);
 
         if (!AskSyncConfirm(files, bytes, delScan)) return 0; // nothing touched
         // Space check after confirmation: the purge frees space but runs after
@@ -309,7 +303,7 @@ int wmain(int argc, wchar_t** argv) {
         // Hand the scan's verdicts to the engine: the copy phase then skips
         // its second round of destination stats (see SetCarriedClasses).
         SetCarriedClasses(std::move(scan.classes));
-        int code = RunSyncWithUI(jobs, bytes, files, skipped, skipSet, extras);
+        int code = RunSyncWithUI(jobs, bytes, files, skipped, extras);
         return (code >= 8) ? code : 0;
     }
 
@@ -329,7 +323,7 @@ int wmain(int argc, wchar_t** argv) {
     // single rename BEFORE any scan or window: no conflict is possible there,
     // and walking 500k files first would be pure ceremony. Cross-volume or
     // existing destinations fall through to the normal flow.
-    if (op == Operation::Move && UseNativeEngine()) {
+    if (op == Operation::Move) {
         jobs.erase(std::remove_if(jobs.begin(), jobs.end(), TryQuickRenameMove),
                    jobs.end());
         if (jobs.empty()) return 0; // everything moved by rename — done
@@ -358,13 +352,10 @@ int wmain(int argc, wchar_t** argv) {
     unsigned long long bytes = 0, files = 0;
     ExpectedFor(scan, policy, bytes, files);
     SkipInfo skipped = SkippedFor(scan, policy);
-    // Source paths robocopy will list (/V) but not copy — lets the dialog
-    // paint those stretches green instead of counting them as speed.
-    std::unordered_set<std::wstring> skipSet = SkipSetFor(scan, policy);
 
     // Hand the scan's verdicts to the engine: the copy phase then skips its
     // second round of destination stats (see SetCarriedClasses).
     SetCarriedClasses(std::move(scan.classes));
-    int code = RunJobsWithUI(op, jobs, bytes, files, policy, skipped, skipSet);
+    int code = RunJobsWithUI(op, jobs, bytes, files, policy, skipped);
     return (code >= 8) ? code : 0;
 }

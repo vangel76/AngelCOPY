@@ -90,26 +90,8 @@ static void Setup(const std::wstring& base) {
     WriteFileText(base + L"\\dest\\src\\older.txt", "DEST-NEWER-DATA", 0);
 }
 
-static void RunPolicy(Conflict policy, const char* name, const char* expNewer,
-                      const char* expOlder) {
-    std::wstring base = g_root + L"\\p_" + std::to_wstring((int)policy);
-    Setup(base);
-
-    std::vector<std::wstring> sources{base + L"\\src"};
-    auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
-    RunJobs(Operation::Copy, jobs, policy);
-
-    printf("%s:\n", name);
-    std::string newer = ReadText(base + L"\\dest\\src\\newer.txt");
-    std::string older = ReadText(base + L"\\dest\\src\\older.txt");
-    std::string lonely = ReadText(base + L"\\dest\\src\\lonely.txt");
-    check(newer == expNewer, (std::string("  newer.txt == ") + expNewer +
-                              " (got " + newer + ")").c_str());
-    check(older == expOlder, (std::string("  older.txt == ") + expOlder +
-                              " (got " + older + ")").c_str());
-    check(lonely == "FROM-SOURCE", "  lonely.txt always copied");
-    RmTree(base);
-}
+// (On-disk policy outcomes live in tests\test_native.cpp's policy matrix —
+// the robocopy execution path this file once exercised was removed.)
 
 int wmain() {
     wchar_t tmp[MAX_PATH];
@@ -140,26 +122,22 @@ int wmain() {
         ExpectedFor(s, Conflict::Skip, b, f);
         check(f == 1, "ExpectedFor(Skip) = lonely only = 1 file");
 
-        // The skip set feeds the progress UI's green (skipped) stretches; it
-        // must mirror SkippedFor exactly and hold lowercased SOURCE paths.
-        auto low = [](std::wstring w) {
-            for (auto& ch : w) ch = (wchar_t)towlower(ch);
-            return w;
-        };
-        auto setRep = SkipSetFor(s, Conflict::Replace);
-        auto setNew = SkipSetFor(s, Conflict::ReplaceIfNewer);
-        auto setSkp = SkipSetFor(s, Conflict::Skip);
-        check(setRep.size() == 1 &&
-                  setRep.count(low(base + L"\\src\\same.txt")) == 1,
-              "SkipSetFor(Replace) = same.txt only");
-        check(setNew.size() == 2 &&
-                  setNew.count(low(base + L"\\src\\older.txt")) == 1,
-              "SkipSetFor(OnlyIfNewer) = same + older");
-        check(setSkp.size() == 3 &&
-                  setSkp.count(low(base + L"\\src\\newer.txt")) == 1,
-              "SkipSetFor(Skip) = same + newer + older");
-        check(setRep.count(low(base + L"\\src\\lonely.txt")) == 0,
-              "lonely files never in a skip set");
+        // THE policy predicate every aggregate and the engine derive from.
+        printf("PolicyCopies:\n");
+        check(PolicyCopies(Conflict::Replace, FileClass::Lonely) &&
+                  PolicyCopies(Conflict::Skip, FileClass::Lonely),
+              "Lonely copied under every policy");
+        check(!PolicyCopies(Conflict::Replace, FileClass::Same) &&
+                  !PolicyCopies(Conflict::Skip, FileClass::Same),
+              "Same never copied");
+        check(PolicyCopies(Conflict::Replace, FileClass::DiffNewer) &&
+                  PolicyCopies(Conflict::ReplaceIfNewer, FileClass::DiffNewer) &&
+                  !PolicyCopies(Conflict::Skip, FileClass::DiffNewer),
+              "DiffNewer copied except under Skip");
+        check(PolicyCopies(Conflict::Replace, FileClass::DiffOlder) &&
+                  !PolicyCopies(Conflict::ReplaceIfNewer, FileClass::DiffOlder) &&
+                  !PolicyCopies(Conflict::Skip, FileClass::DiffOlder),
+              "DiffOlder copied only under Replace");
 
         // Needed disk space: lonely full, overwrites only their growth. The
         // fixture's files are tiny, so assert the relationships, not literals:
@@ -202,26 +180,6 @@ int wmain() {
               "growth = 800 (bigger +800, smaller +0), not 1100 full size");
         RmTree(base);
     }
-
-    // ---- flags ----
-    {
-        RoboJob j;
-        j.srcDir = L"C:\\a"; j.dstDir = L"C:\\b";
-        printf("Flags:\n");
-        auto rep = BuildRobocopyArgs(Operation::Copy, j, true, Conflict::Replace);
-        auto skip = BuildRobocopyArgs(Operation::Copy, j, true, Conflict::Skip);
-        auto newer = BuildRobocopyArgs(Operation::Copy, j, true, Conflict::ReplaceIfNewer);
-        check(rep.find(L"/XO") == std::wstring::npos, "Replace: no /XO");
-        check(skip.find(L"/XC /XN /XO") != std::wstring::npos, "Skip: /XC /XN /XO");
-        check(newer.find(L"/XO") != std::wstring::npos &&
-              newer.find(L"/XN") == std::wstring::npos, "OnlyIfNewer: /XO, no /XN");
-        check(rep.find(L"/MT:64") != std::wstring::npos, "always /MT:64");
-    }
-
-    // ---- real on-disk outcomes ----
-    RunPolicy(Conflict::Replace, "Replace all", "SRC-NEW", "SRC-OLD");
-    RunPolicy(Conflict::ReplaceIfNewer, "Only if newer", "SRC-NEW", "DEST-NEWER-DATA");
-    RunPolicy(Conflict::Skip, "Skip existing", "DEST-OLD-DATA", "DEST-NEWER-DATA");
 
     RmTree(g_root);
     printf("\n%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES PRESENT");

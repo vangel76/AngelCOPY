@@ -48,14 +48,6 @@ bool IsDirectory(const std::wstring& path) {
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-// Wrap in quotes for the command line. A robocopy path argument must not end in
-// a backslash directly before the closing quote (the backslash escapes the
-// quote), so a bare-root path like "C:\" is passed as "C:\\".
-std::wstring Quote(std::wstring s) {
-    if (!s.empty() && s.back() == L'\\') s.push_back(L'\\');
-    return L"\"" + s + L"\"";
-}
-
 std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
     std::wstring d = StripTrailingSep(dir);
     return d + L"\\" + name;
@@ -74,14 +66,6 @@ std::wstring LowerCopy(std::wstring s) { return acutil::LowerCopy(std::move(s));
 // Set once in main before any scan/transfer, read-only thereafter from every
 // walk thread (see Robocopy.h). Lowercased directory names.
 std::unordered_set<std::wstring> g_excludedDirs;
-
-// Whether Account() collects the per-file skip-path lists (samePaths etc.).
-// Only the robocopy fallback engine reads the SkipSetFor set built from them
-// (pipe-line matching); the native engine reports skips itself. Defaults ON
-// so the unit tests and the fallback keep their lists; main.cpp switches it
-// off for native runs — on a 500k-file re-mirror the lists were ~1M string
-// allocations pinned for the whole transfer, feeding nothing.
-bool g_collectSkipPaths = true;
 
 // Whether Account() collects per-file verdicts into ScanResult::classes for
 // the engine carry (default OFF: tests and the robocopy fallback don't use
@@ -189,86 +173,6 @@ std::vector<RoboJob> PlanJobs(Operation op,
     return jobs;
 }
 
-std::wstring BuildRobocopyArgs(Operation op, const RoboJob& job, bool parseable,
-                               Conflict policy) {
-    std::wstring args;
-    args += Quote(job.srcDir);
-    args += L" ";
-    args += Quote(job.dstDir);
-
-    for (const auto& f : job.files) {
-        args += L" ";
-        args += Quote(f);
-    }
-
-    // /MT:64  -> 64-thread multithreaded copy (the whole point of this tool)
-    args += L" /MT:64";
-
-    if (job.files.empty()) {
-        // Whole-tree folder copy.
-        args += L" /E";                 // subdirs incl. empty ones
-        if (op == Operation::Move) args += L" /MOVE"; // move files + dirs
-    } else {
-        // Loose-file copy; only files, no /E.
-        if (op == Operation::Move) args += L" /MOV";  // move files only
-    }
-
-    args += L" /COPY:DAT";   // data + attributes + timestamps (no owner/ACL: no admin needed)
-    args += L" /R:2 /W:2";   // cap retries/wait so a locked file can't hang forever
-    args += L" /XJ";         // skip junctions (avoid symlink loops)
-
-    // /XD: excluded folder names (Unreal preset). Whole-tree jobs only — a
-    // loose-file job has no subdirs to exclude. robocopy /XD is case-insensitive
-    // and excludes from the purge too, matching the native walk's behavior.
-    if (job.files.empty() && AnyExcludedDirs()) {
-        // Emit the ACTUAL exclusion state, not UnrealExcludeNames(): the
-        // fallback engine must not diverge from the native walks if the set
-        // ever comes from somewhere else. (Lowercased is fine — /XD is
-        // case-insensitive.)
-        args += L" /XD";
-        for (const auto& n : ExcludedDirNames()) { args += L" "; args += Quote(n); }
-    }
-
-    // Conflict handling. robocopy's default overwrites anything that differs —
-    // including overwriting a NEWER destination with an OLDER source — so the
-    // non-default policies exist to make that survivable.
-    switch (policy) {
-    case Conflict::Skip:
-        args += L" /XC /XN /XO"; // exclude changed/newer/older -> only new files
-        break;
-    case Conflict::ReplaceIfNewer:
-        args += L" /XO";         // exclude older source files
-        break;
-    case Conflict::Replace:
-        break;                   // default: overwrite everything that differs
-    }
-
-    if (parseable) {
-        // Machine-readable output for the progress UI: one <bytes>\t<fullpath>
-        // line per file, no headers/summary/dir-list. /NP is important: it drops
-        // the per-file percentage stream, which otherwise floods the pipe and
-        // throttles robocopy's copy threads when the reader can't keep up.
-        // Errors still print regardless of these flags.
-        //
-        // /V makes robocopy list SKIPPED files too (same + policy-excluded),
-        // which is what lets the progress UI advance and paint those stretches
-        // green. Without it skipped files are invisible in the output. Measured
-        // cost: ~0.17 ms per skipped file (4000 all-skip: 80 ms -> 880 ms;
-        // 12000: 116 ms -> 2155 ms) — linear, and only skips pay it.
-        args += L" /BYTES /FP /NC /NDL /NJH /NJS /NP /V";
-    } else {
-        args += L" /NP /NDL"; // quiet-ish console
-    }
-    return args;
-}
-
-std::wstring RobocopyExe() {
-    wchar_t sys[MAX_PATH];
-    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
-    return (n && n < MAX_PATH) ? std::wstring(sys) + L"\\robocopy.exe"
-                              : L"robocopy.exe";
-}
-
 namespace {
 
 constexpr size_t kConflictSampleMax = 500;
@@ -322,17 +226,14 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
         return;
     case FileClass::Same:
         acc.sameFiles++;   acc.sameBytes += size;
-        if (g_collectSkipPaths) acc.samePaths.push_back(LowerCopy(src));
         return;
     case FileClass::DiffNewer:
         acc.newerFiles++;  acc.newerBytes += size;
         acc.newerGrowBytes += grow;
-        if (g_collectSkipPaths) acc.newerPaths.push_back(LowerCopy(src));
         break;
     case FileClass::DiffOlder:
         acc.olderFiles++;  acc.olderBytes += size;
         acc.olderGrowBytes += grow;
-        if (g_collectSkipPaths) acc.olderPaths.push_back(LowerCopy(src));
         break;
     }
     acc.conflicts++;
@@ -438,13 +339,6 @@ void MergeScan(ScanResult& into, ScanResult& from) {
     for (auto& s : from.conflictSample)
         if (into.conflictSample.size() < kConflictSampleMax)
             into.conflictSample.push_back(std::move(s));
-    auto app = [](std::vector<std::wstring>& a, std::vector<std::wstring>& b) {
-        a.insert(a.end(), std::make_move_iterator(b.begin()),
-                 std::make_move_iterator(b.end()));
-    };
-    app(into.samePaths, from.samePaths);
-    app(into.newerPaths, from.newerPaths);
-    app(into.olderPaths, from.olderPaths);
     if (into.classes.empty()) into.classes = std::move(from.classes);
     else into.classes.merge(from.classes);
 }
@@ -523,14 +417,13 @@ namespace {
 struct ClassBucket {
     FileClass fc;
     unsigned long long files, bytes;
-    const std::vector<std::wstring>* paths; // null for Lonely (never skipped)
 };
 
 std::array<ClassBucket, 4> BucketsOf(const ScanResult& s) {
-    return {{{FileClass::Lonely, s.lonelyFiles, s.lonelyBytes, nullptr},
-             {FileClass::Same, s.sameFiles, s.sameBytes, &s.samePaths},
-             {FileClass::DiffNewer, s.newerFiles, s.newerBytes, &s.newerPaths},
-             {FileClass::DiffOlder, s.olderFiles, s.olderBytes, &s.olderPaths}}};
+    return {{{FileClass::Lonely, s.lonelyFiles, s.lonelyBytes},
+             {FileClass::Same, s.sameFiles, s.sameBytes},
+             {FileClass::DiffNewer, s.newerFiles, s.newerBytes},
+             {FileClass::DiffOlder, s.olderFiles, s.olderBytes}}};
 }
 
 } // namespace
@@ -626,18 +519,6 @@ std::vector<std::wstring> ScanExtras(const std::vector<RoboJob>& jobs,
     return extras;
 }
 
-std::unordered_set<std::wstring> SkipSetFor(const ScanResult& s, Conflict policy) {
-    // Exactly the paths of every class the policy does NOT copy — under
-    // Replace, newer/older files ARE copied and must not be in the set, or
-    // real copies would be painted as skips. Same predicate as SkippedFor by
-    // construction.
-    std::unordered_set<std::wstring> set;
-    for (const auto& b : BucketsOf(s))
-        if (!PolicyCopies(policy, b.fc) && b.paths)
-            set.insert(b.paths->begin(), b.paths->end());
-    return set;
-}
-
 SkipInfo SkippedFor(const ScanResult& s, Conflict policy) {
     SkipInfo k;
     for (const auto& b : BucketsOf(s)) {
@@ -655,53 +536,12 @@ SkipInfo SkippedFor(const ScanResult& s, Conflict policy) {
     return k;
 }
 
-int RunJobs(Operation op, const std::vector<RoboJob>& jobs, Conflict policy) {
-    std::wstring robocopy = RobocopyExe();
-
-    int worst = 0;
-    for (size_t i = 0; i < jobs.size(); ++i) {
-        const RoboJob& job = jobs[i];
-        std::wstring args = BuildRobocopyArgs(op, job, /*parseable=*/false, policy);
-
-        std::wstring cmd = Quote(robocopy) + L" " + args;
-
-        wprintf(L"\n[AngelCOPY] %s  ->  %s\n",
-                job.srcDir.c_str(), job.dstDir.c_str());
-
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-
-        std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
-        mutableCmd.push_back(L'\0');
-
-        BOOL ok = CreateProcessW(robocopy.c_str(), mutableCmd.data(), nullptr,
-                                 nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
-        if (!ok) {
-            wprintf(L"[AngelCOPY] failed to launch robocopy (err %lu)\n",
-                    GetLastError());
-            worst = 16;
-            continue;
-        }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-
-        if (static_cast<int>(code) > worst) worst = static_cast<int>(code);
-    }
-    return worst;
-}
-
 // ---- directory exclusions (Unreal preset) --------------------------------
 
 void SetExcludedDirs(const std::vector<std::wstring>& names) {
     g_excludedDirs.clear();
     for (const auto& n : names) g_excludedDirs.insert(LowerCopy(n));
 }
-
-void SetCollectSkipPaths(bool on) { g_collectSkipPaths = on; }
 
 void SetCollectClasses(bool on) { g_collectClasses = on; }
 
@@ -735,10 +575,6 @@ bool IsExcludedDir(const wchar_t* name) {
 }
 
 bool AnyExcludedDirs() { return !g_excludedDirs.empty(); }
-
-std::vector<std::wstring> ExcludedDirNames() {
-    return {g_excludedDirs.begin(), g_excludedDirs.end()};
-}
 
 const std::vector<std::wstring>& UnrealExcludeNames() {
     // The four regenerable folders from the user's own robocopy /XD line.
