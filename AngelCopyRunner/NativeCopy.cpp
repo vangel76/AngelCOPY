@@ -147,18 +147,31 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
     // per-file ClassifyFile destination stat (one round-trip per file; the
     // dominant cost on a slow USB/network target) is skipped.
     bool dstFresh = true;
-    if (!CreateDirectoryExW(ExtPath(srcDir).c_str(), ExtPath(dstDir).c_str(),
-                            nullptr)) {
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    // Retried like a file (/R:2 /W:2): an SMB target transiently answered
+    // ERROR_PATH_NOT_FOUND for directories that DID exist (seen live, Sep 2026,
+    // a run of ~30 sibling dirs on \\mp-fileserver) — without the retry each
+    // one dropped its whole subtree from the transfer. A directory that is
+    // there after all is taken as existing, never reported.
+    const std::wstring xsDir = ExtPath(srcDir), xdDir = ExtPath(dstDir);
+    for (int attempt = 0;; ++attempt) {
+        if (CreateDirectoryExW(xsDir.c_str(), xdDir.c_str(), nullptr)) break;
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            if (CreateDirectoryW(xdDir.c_str(), nullptr))
+                break; // created via the plain fallback: still fresh
+            err = GetLastError();
+        }
+        if (err == ERROR_ALREADY_EXISTS) { dstFresh = false; break; }
+        DWORD a = GetFileAttributesW(xdDir.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
             dstFresh = false;
-        } else if (CreateDirectoryW(ExtPath(dstDir).c_str(), nullptr)) {
-            // created via the plain fallback: still fresh
-        } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            dstFresh = false;
-        } else {
-            ReportError(sink, dstDir, GetLastError());
+            break;
+        }
+        if (attempt >= kRetries || Cancelled(sink)) {
+            ReportError(sink, dstDir, err);
             return; // nothing below can succeed
         }
+        Sleep(kRetryWaitMs);
     }
 
     std::vector<Item> run;
