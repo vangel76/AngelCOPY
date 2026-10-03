@@ -611,6 +611,244 @@ static void TestCarriedClasses() {
     RmTree(base);
 }
 
+// ---- per-file conflict decisions (image compare dialog) ---------------------
+
+static void WriteFilled(const std::wstring& path, unsigned long long size,
+                        unsigned char fill, int dayOffset) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    std::vector<unsigned char> chunk(1 << 20, fill);
+    for (unsigned long long done = 0; done < size;) {
+        DWORD n = (DWORD)std::min<unsigned long long>(chunk.size(), size - done);
+        DWORD w = 0;
+        WriteFile(h, chunk.data(), n, &w, nullptr);
+        done += n;
+    }
+    if (dayOffset != 0) {
+        FILETIME ft;
+        SYSTEMTIME st;
+        GetSystemTime(&st);
+        SystemTimeToFileTime(&st, &ft);
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        u.QuadPart += (long long)dayOffset * 24LL * 3600LL * 10000000LL;
+        ft.dwLowDateTime = u.LowPart;
+        ft.dwHighDateTime = u.HighPart;
+        SetFileTime(h, nullptr, nullptr, &ft);
+    }
+    CloseHandle(h);
+}
+
+static unsigned char FirstByte(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    unsigned char b = 0;
+    DWORD r = 0;
+    ReadFile(h, &b, 1, &r, nullptr);
+    CloseHandle(h);
+    return b;
+}
+
+// Overwrite / Skip / Rename decisions must override the policy for exactly
+// their file — on the deferred pool path (whole tree), the inline big-file
+// path, and the loose-file plan — while undecided conflicts follow the
+// policy. Policy Skip makes every decision observable: without the override
+// nothing would be written at all.
+static void TestFileDecisions() {
+    printf("per-file decisions:\n");
+    const std::wstring base = g_root + L"\\dec";
+    for (int loose = 0; loose < 2; ++loose) {
+        RmTree(base);
+        CreateDirectoryW(base.c_str(), nullptr);
+        CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+        CreateDirectoryW((base + L"\\dest").c_str(), nullptr);
+        const std::wstring S = base + L"\\src";
+        const std::wstring D = loose ? base + L"\\dest" : base + L"\\dest\\src";
+        CreateDirectoryW(D.c_str(), nullptr);
+        for (const wchar_t* n : {L"a.jpg", L"b.jpg", L"c.jpg", L"d.txt"}) {
+            WriteFileText(D + L"\\" + n, "DEST-OLD", -10);
+            WriteFileText(S + L"\\" + n, "SRC-NEW", 0);
+        }
+        // Over the ring threshold: classified inline on the walk thread.
+        const unsigned long long kBig = (33ull << 20) + 7;
+        WriteFilled(D + L"\\big.png", 1234, 0xDD, -10);
+        WriteFilled(S + L"\\big.png", kBig, 0x5A, 0);
+
+        std::unordered_map<std::wstring, FileDecision> m;
+        auto put = [&](const wchar_t* n, FileAction a, const wchar_t* nn) {
+            FileDecision d;
+            d.action = a;
+            d.newName = nn;
+            m[acutil::LowerCopy(S + L"\\" + n)] = d;
+        };
+        put(L"a.jpg", FileAction::Overwrite, L"");
+        put(L"b.jpg", FileAction::Skip, L"");
+        put(L"c.jpg", FileAction::Rename, L"c (2).jpg");
+        put(L"big.png", FileAction::Rename, L"big (2).png");
+        SetFileDecisions(std::move(m));
+
+        std::vector<std::wstring> sources;
+        if (loose)
+            for (const wchar_t* n : {L"a.jpg", L"b.jpg", L"c.jpg", L"d.txt", L"big.png"})
+                sources.push_back(S + L"\\" + n);
+        else
+            sources.push_back(S);
+        auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
+        Counts c;
+        RunNativeJobs(Operation::Copy, jobs, Conflict::Skip, c.Sink());
+
+        printf(loose ? " loose files:\n" : " whole tree:\n");
+        check(ReadText(D + L"\\a.jpg") == "SRC-NEW", "  Overwrite beat policy Skip");
+        check(ReadText(D + L"\\b.jpg") == "DEST-OLD", "  Skip kept the destination");
+        check(ReadText(D + L"\\c.jpg") == "DEST-OLD", "  Rename left the original alone");
+        check(ReadText(D + L"\\c (2).jpg") == "SRC-NEW", "  Rename wrote 'c (2).jpg'");
+        check(ReadText(D + L"\\d.txt") == "DEST-OLD", "  undecided file followed the policy");
+        check(SizeOf(D + L"\\big.png") == 1234, "  big file: original alone");
+        check(SizeOf(D + L"\\big (2).png") == kBig &&
+                  FirstByte(D + L"\\big (2).png") == 0x5A,
+              "  big file: renamed copy via the ring");
+        check(c.skips == 2, "  skips = b.jpg + d.txt");
+        check(c.errors == 0, "  no errors");
+    }
+
+    // Move + Rename: source leaves, original stays, renamed copy arrives.
+    RmTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW((base + L"\\src").c_str(), nullptr);
+    CreateDirectoryW((base + L"\\dest").c_str(), nullptr);
+    WriteFileText(base + L"\\dest\\p.jpg", "DEST-OLD", -10);
+    WriteFileText(base + L"\\src\\p.jpg", "SRC-NEW", 0);
+    // A file already sits under the reserved name: noReplace must refuse it.
+    WriteFileText(base + L"\\dest\\q.jpg", "DEST-OLD", -10);
+    WriteFileText(base + L"\\dest\\q (2).jpg", "PRECIOUS", -10);
+    WriteFileText(base + L"\\src\\q.jpg", "SRC-NEW", 0);
+    {
+        std::unordered_map<std::wstring, FileDecision> m;
+        FileDecision d;
+        d.action = FileAction::Rename;
+        d.newName = L"p (2).jpg";
+        m[acutil::LowerCopy(base + L"\\src\\p.jpg")] = d;
+        d.newName = L"q (2).jpg"; // deliberately taken (appeared after the prompt)
+        m[acutil::LowerCopy(base + L"\\src\\q.jpg")] = d;
+        SetFileDecisions(std::move(m));
+    }
+    std::vector<std::wstring> mv{base + L"\\src\\p.jpg", base + L"\\src\\q.jpg"};
+    auto jm = PlanJobs(Operation::Move, base + L"\\dest", mv);
+    Counts cm;
+    RunNativeJobs(Operation::Move, jm, Conflict::Replace, cm.Sink());
+    printf(" move + rename:\n");
+    check(!Exists(base + L"\\src\\p.jpg"), "  source moved away");
+    check(ReadText(base + L"\\dest\\p.jpg") == "DEST-OLD", "  original untouched");
+    check(ReadText(base + L"\\dest\\p (2).jpg") == "SRC-NEW", "  arrived as 'p (2).jpg'");
+    check(ReadText(base + L"\\dest\\q (2).jpg") == "PRECIOUS",
+          "  taken rename target NOT overwritten");
+    check(ReadText(base + L"\\src\\q.jpg") == "SRC-NEW", "  its source kept");
+    check(cm.errors == 1, "  the refusal is reported as an error");
+
+    SetFileDecisions({});
+    RmTree(base);
+}
+
+// RenamePlanner: "(n)" names avoid existing destination files, files still
+// coming in (same source folder, or another loose job into the same folder)
+// and names it already handed out.
+static void TestRenamePlanner() {
+    printf("rename planner:\n");
+    const std::wstring base = g_root + L"\\rp";
+    RmTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+    for (const wchar_t* d : {L"\\src", L"\\other", L"\\dest"})
+        CreateDirectoryW((base + d).c_str(), nullptr);
+    WriteFileText(base + L"\\dest\\a.jpg", "D", 0);
+    WriteFileText(base + L"\\dest\\a (2).jpg", "D", 0);
+    WriteFileText(base + L"\\src\\a.jpg", "S", 0);
+    WriteFileText(base + L"\\src\\a (3).jpg", "S", 0);     // incoming, same folder
+    WriteFileText(base + L"\\dest\\x.jpg", "D", 0);
+    WriteFileText(base + L"\\src\\x.jpg", "S", 0);
+    WriteFileText(base + L"\\other\\x (2).jpg", "S", 0);   // incoming, other job
+
+    std::vector<std::wstring> sources{base + L"\\src\\a.jpg", base + L"\\src\\x.jpg",
+                                      base + L"\\other\\x (2).jpg"};
+    auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
+    RenamePlanner rp(jobs);
+    ConflictItem a{base + L"\\src\\a.jpg", base + L"\\dest\\a.jpg", 1, 1,
+                   FileClass::DiffNewer};
+    ConflictItem x{base + L"\\src\\x.jpg", base + L"\\dest\\x.jpg", 1, 1,
+                   FileClass::DiffNewer};
+    check(rp.Peek(a) == L"a (4).jpg" && rp.Peek(a) == L"a (4).jpg",
+          "  Peek shows the name without reserving it");
+    check(rp.Reserve(a) == L"a (4).jpg", "  skips existing (2) and incoming (3)");
+    check(rp.Reserve(a) == L"a (5).jpg", "  never hands out a name twice");
+    check(rp.Reserve(x) == L"x (3).jpg", "  skips a name another job brings in");
+    check(NumberedName(L"noext", 2) == L"noext (2)", "  NumberedName without extension");
+    check(NumberedName(L"a.tar.gz", 2) == L"a.tar (2).gz", "  NumberedName: last dot");
+    check(IsImageFile(L"C:\\x\\IMG.JPG") && IsImageFile(L"r.cr3") &&
+              !IsImageFile(L"doc.txt") && !IsImageFile(L"C:\\a.jpg\\noext"),
+          "  IsImageFile by extension, case-insensitive");
+    RmTree(base);
+}
+
+// Totals corrected for decisions: what the progress bar, the skip report and
+// the space check see must match what the engine will do.
+static void TestAdjustForDecisions() {
+    printf("decision totals:\n");
+    std::vector<ConflictItem> items = {
+        {L"C:\\s\\o.jpg", L"C:\\d\\o.jpg", 100, 40, FileClass::DiffNewer},
+        {L"C:\\s\\k.jpg", L"C:\\d\\k.jpg", 200, 10, FileClass::DiffOlder},
+        {L"C:\\s\\r.jpg", L"C:\\d\\r.jpg", 300, 290, FileClass::DiffNewer},
+        {L"C:\\s\\u.txt", L"C:\\d\\u.txt", 50, 0, FileClass::DiffNewer},
+    };
+    std::unordered_map<std::wstring, FileDecision> m;
+    FileDecision d;
+    d.action = FileAction::Skip;      m[L"c:\\s\\o.jpg"] = d;
+    d.action = FileAction::Overwrite; m[L"c:\\s\\k.jpg"] = d;
+    d.action = FileAction::Rename;    d.newName = L"r (2).jpg"; m[L"c:\\s\\r.jpg"] = d;
+    SetFileDecisions(std::move(m));
+
+    // Policy Replace copies all four: bytes 650, files 4, need = growth 60+190+10+50.
+    unsigned long long bytes = 650, files = 4, need = 310;
+    SkipInfo k;
+    AdjustForDecisions(items, Conflict::Replace, bytes, files, k, need);
+    check(bytes == 550 && files == 3, "  skip removed o.jpg from the copy totals");
+    check(k.policyFiles == 1 && k.policyBytes == 100 && k.byChoice,
+          "  ...and moved it into the skip line (by choice)");
+    check(need == 310 - 60 + (300 - 10), "  rename costs full size, skip frees its growth");
+
+    // Policy Skip copies none: the Overwrite and Rename picks add back.
+    bytes = 0; files = 0; need = 0;
+    SkipInfo k2;
+    k2.policyFiles = 4; k2.policyBytes = 650;
+    AdjustForDecisions(items, Conflict::Skip, bytes, files, k2, need);
+    check(bytes == 500 && files == 2, "  overwrite + rename added under policy Skip");
+    check(k2.policyFiles == 2 && k2.policyBytes == 150, "  o.jpg + u.txt still skipped");
+    check(need == 190 + 300, "  overwrite growth + rename full size");
+    SetFileDecisions({});
+}
+
+// The scan collects every conflict (with sizes) when asked, so the compare
+// dialog can walk them and the totals can be corrected.
+static void TestConflictItems() {
+    printf("scan conflict items:\n");
+    const std::wstring base = g_root + L"\\ci";
+    SetupConflict(base);
+    std::vector<std::wstring> sources{base + L"\\src"};
+    auto jobs = PlanJobs(Operation::Copy, base + L"\\dest", sources);
+    SetCollectConflicts(true);
+    ScanResult r = ScanJobs(jobs);
+    SetCollectConflicts(false);
+    check(r.conflicts == 2 && r.conflictItemsComplete(), "  both conflicts collected");
+    bool sizes = true;
+    for (const auto& c : r.conflictItems)
+        sizes = sizes && c.size == SizeOf(c.src) && c.dstSize == SizeOf(c.dst);
+    check(sizes, "  source and destination sizes recorded");
+    ScanResult off = ScanJobs(jobs);
+    check(off.conflictItems.empty() && !off.conflictItemsComplete(),
+          "  collection off by default (not offered)");
+    RmTree(base);
+}
+
 int wmain() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -632,6 +870,10 @@ int wmain() {
     TestLongPaths();
     TestExcludeDirs();
     TestCarriedClasses();
+    TestFileDecisions();
+    TestRenamePlanner();
+    TestAdjustForDecisions();
+    TestConflictItems();
 
     RmTree(g_root);
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

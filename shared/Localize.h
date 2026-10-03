@@ -138,6 +138,27 @@ enum class S {
     // ---- tray: open the quick guide ----
     TrayGuide,
 
+    // ---- image compare dialog (per-file conflict decisions) ----
+    // Appended at the end (positional tables).
+    BtnDecideEach,     // conflict prompt: open the per-image compare dialog
+    CmpCaption,
+    CmpHead,           // index, total  ("Image 3 of 17 already exists")
+    CmpNew, CmpExisting,
+    CmpSize,           // human bytes, marker
+    CmpDims,           // width, height, marker
+    CmpDimsUnknown,
+    CmpModified,       // datetime, marker
+    CmpMarkNewer, CmpMarkLarger, CmpMarkMorePixels,
+    CmpNoPreview,
+    CmpClickHint,
+    // One/Many pair: the count meets a verb/article in both languages.
+    CmpAllOne,         // (no count: exactly one more)
+    CmpAllMany,        // count
+    BtnOverwrite, BtnSkipOne, BtnKeepBoth,
+    WhyChosen,         // skip-report reason after per-file decisions
+    CmpKeepThis,       // band over the hovered thumbnail
+    CmpRenameTo,       // new name for "Keep both" (%s)
+
     COUNT
 };
 

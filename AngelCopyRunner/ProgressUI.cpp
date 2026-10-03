@@ -756,7 +756,8 @@ void ShowReport(HWND hwnd, UiState* ui, bool failed) {
         text += line;
     }
     if (k.policyFiles) {
-        const wchar_t* why = loc::T(ui->policy == Conflict::Skip
+        const wchar_t* why = loc::T(k.byChoice ? loc::S::WhyChosen
+                                    : ui->policy == Conflict::Skip
                                         ? loc::S::WhySkipExisting
                                         : loc::S::WhyOnlyNewer);
         StringCchPrintfW(line, 512, loc::T(loc::S::SkipPolicy), k.policyFiles,
@@ -883,9 +884,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetWindowTextW(ui->lblRemaining, L"");
                 SetWindowTextW(ui->btnCancel, loc::T(loc::S::BtnClose));
                 ShowReport(hwnd, ui, true);
-            } else if (ui->skipped.any()) {
+            } else if (ui->skipped.identicalFiles ||
+                       (ui->skipped.policyFiles && !ui->skipped.byChoice)) {
                 // Nothing failed, but files were skipped — say so and stay open
                 // so the user actually sees it (same as the error case).
+                // Skips picked per file in the compare dialog are the user's
+                // own answers, not news: those runs auto-close like clean ones.
                 unsigned long long n =
                     ui->skipped.identicalFiles + ui->skipped.policyFiles;
                 wchar_t t[128];

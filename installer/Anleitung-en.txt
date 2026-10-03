@@ -42,6 +42,8 @@ THE PROGRESS DIALOG
   • "Keep window open when done": the dialog stays with statistics including
     the total duration. The choice is remembered globally.
   • On conflicts AngelCOPY asks: Replace / Only if newer / Skip existing.
+    With images involved, "Compare images one by one…" shows source and
+    target side by side – Overwrite / Skip / Keep both.
 
 WINDOWS 11
   The entries live under "Show more options" (Shift+F10) — unless the

@@ -46,6 +46,8 @@ DER FORTSCHRITTSDIALOG
   • Häkchen „Fenster nach Abschluss geöffnet lassen": Dialog bleibt mit
     Statistik inkl. Gesamtdauer stehen. Die Wahl wird global gemerkt.
   • Bei Konflikten fragt AngelCOPY: Ersetzen / Nur neuere / Überspringen.
+    Sind Bilder dabei: „Bilder einzeln vergleichen…" zeigt Quelle und Ziel
+    nebeneinander – Überschreiben / Überspringen / Beide behalten.
 
 WINDOWS 11
   Die Einträge stehen unter „Weitere Optionen anzeigen" (Umschalt+F10) —

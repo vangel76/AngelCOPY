@@ -65,6 +65,14 @@ std::vector<RoboJob> PlanJobs(Operation op,
 // per-file decision the scan made, or totals and outcomes drift apart.
 enum class FileClass { Lonely, Same, DiffNewer, DiffOlder };
 
+// One destination file that exists AND differs — what the per-image compare
+// dialog shows and what the per-file decision totals are corrected from.
+struct ConflictItem {
+    std::wstring src, dst;
+    unsigned long long size = 0, dstSize = 0;
+    FileClass fc = FileClass::DiffNewer;
+};
+
 // Pre-scan across all jobs: total bytes/files (drives the percentage bar) plus
 // the destination files that already exist AND differ from the source — i.e.
 // exactly the files robocopy would silently overwrite. Identical files are not
@@ -92,6 +100,14 @@ struct ScanResult {
     // phase. Fast-path Lonely files (destination dir absent) are not in here;
     // the engine's dstFresh shortcut covers them statlessly anyway.
     std::unordered_map<std::wstring, FileClass> classes;
+
+    // EVERY conflict with its sizes, collected only when SetCollectConflicts
+    // is on and only up to kMaxConflictItems — the per-file compare dialog
+    // needs the complete list (conflictItemsComplete()), or it is not offered.
+    std::vector<ConflictItem> conflictItems;
+    bool conflictItemsComplete() const {
+        return conflictItems.size() == conflicts;
+    }
 };
 ScanResult ScanJobs(const std::vector<RoboJob>& jobs,
                     ScanProgress* prog = nullptr);
@@ -136,9 +152,71 @@ unsigned long long NeededSpaceFor(const ScanResult& s, Conflict policy);
 struct SkipInfo {
     unsigned long long identicalFiles = 0, identicalBytes = 0; // already up to date
     unsigned long long policyFiles = 0,    policyBytes = 0;    // excluded by policy
+    // Per-file decisions were made (compare dialog): the policy skips are
+    // then the user's own picks, and the report says so instead of naming a
+    // policy button that was never pressed.
+    bool byChoice = false;
     bool any() const { return identicalFiles || policyFiles; }
 };
 SkipInfo SkippedFor(const ScanResult& s, Conflict policy);
+
+// ---- per-file conflict decisions (the image compare dialog) --------------
+// What the user picked for ONE conflicting file. Overrides the policy for
+// that file only; every file without a decision follows the policy.
+enum class FileAction { Overwrite, Skip, Rename };
+struct FileDecision {
+    FileAction action = FileAction::Overwrite;
+    std::wstring newName; // Rename only: the new FILE name ("a (2).jpg"), same dir
+};
+
+// Same lifecycle as the carried classes: set once between the prompt and the
+// run, read concurrently by the copy pool. Keyed by the LOWERCASED source
+// path. The engine consults it only for files that classify as a conflict
+// (DiffNewer/DiffOlder) at copy time — a file that became identical or
+// vanished at the destination since the prompt needs no decision.
+//
+// Never set for a mirror: a renamed "a (2).jpg" is not in the source, so the
+// purge phase would delete the very file the user asked to keep.
+void SetFileDecisions(std::unordered_map<std::wstring, FileDecision>&& m);
+bool AnyFileDecisions();
+bool LookupFileDecision(const std::wstring& srcLower, FileDecision& d);
+
+// Collect ScanResult::conflictItems (default OFF; GUI copy/move turn it on).
+constexpr size_t kMaxConflictItems = 10000;
+void SetCollectConflicts(bool on);
+
+// Correct the policy totals (ExpectedFor / SkippedFor / NeededSpaceFor) for
+// the decisions currently set: a file the policy copies but the user skipped
+// moves into the skip line and vice versa; a rename costs its FULL size on
+// disk (a new file), an overwrite only its growth (in-place, measured).
+void AdjustForDecisions(const std::vector<ConflictItem>& items, Conflict policy,
+                        unsigned long long& bytes, unsigned long long& files,
+                        SkipInfo& skipped, unsigned long long& need);
+
+// Image by extension (photo + RAW formats) — decides which conflicts the
+// compare dialog walks. Everything else goes through the all-at-once prompt.
+bool IsImageFile(const std::wstring& path);
+
+// "<stem> (n)<ext>" — Explorer's keep-both naming ("IMG_1.jpg" -> "IMG_1 (2).jpg").
+std::wstring NumberedName(const std::wstring& name, int n);
+
+// Hands out "keep both" names that collide with nothing: not an existing
+// destination entry, not a file still COMING IN to that destination folder
+// (source "a (2).jpg" next to a renamed "a.jpg" would otherwise be overwritten
+// by it, or overwrite it), and not a name already handed out this run.
+class RenamePlanner {
+public:
+    explicit RenamePlanner(const std::vector<RoboJob>& jobs);
+    // The name Reserve would hand out right now, without reserving it (the
+    // compare dialog shows it before the user decides).
+    std::wstring Peek(const ConflictItem& it) const;
+    // Picks and reserves the new file name for a conflicting item.
+    std::wstring Reserve(const ConflictItem& it);
+private:
+    std::unordered_set<std::wstring> taken_; // lowercased full dst paths
+    // lowercased loose-job dstDir -> lowercased incoming file names
+    std::unordered_map<std::wstring, std::unordered_set<std::wstring>> incoming_;
+};
 
 // ---- directory exclusions (the Unreal preset) ----------------------------
 // A set of directory NAMES (matched at any depth, case-insensitive) skipped

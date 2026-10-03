@@ -4,6 +4,27 @@ All notable changes to AngelCOPY are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-10-03
+
+### Added
+- **Compare images one by one.** When a copy or move hits existing files and
+  at least one of them is an image, the conflict prompt offers "Compare
+  images one by one…". Each image conflict is shown with source and
+  destination side by side as thumbnails, plus size, dimensions and date
+  (the larger/newer side is marked). Click the image you want to keep —
+  the new one or the existing one (right-click opens it full size) — or
+  Keep both, which stores the incoming file as "name (2).ext" (the name is
+  shown before you choose) and never overwrites anything. "Do the same for all
+  remaining conflicts" applies the choice to every remaining conflict;
+  non-image conflicts left undecided get the usual all-at-once prompt.
+  Progress totals, the skip report and the free-space check follow the
+  per-file choices. Mirror never offers it (the purge would delete a kept
+  copy).
+
+### Changed
+- **Skips chosen in the compare dialog no longer keep the progress window
+  open** — they are the user's own answers. Other skips still do.
+
 ## [1.5.2] — 2026-09-23
 
 ### Removed

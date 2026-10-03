@@ -74,6 +74,10 @@ std::unordered_set<std::wstring> g_excludedDirs;
 bool g_collectClasses = false;
 std::unordered_map<std::wstring, FileClass> g_carriedClasses;
 
+// Compare-dialog plumbing; same set-once-then-read-only contract as above.
+bool g_collectConflicts = false;
+std::unordered_map<std::wstring, FileDecision> g_fileDecisions;
+
 bool SamePath(const std::wstring& a, const std::wstring& b) {
     return LowerCopy(StripTrailingSep(a)) == LowerCopy(StripTrailingSep(b));
 }
@@ -239,6 +243,8 @@ void Account(ScanResult& acc, FileClass fc, unsigned long long size,
     acc.conflicts++;
     if (acc.conflictSample.size() < kConflictSampleMax)
         acc.conflictSample.push_back(dst);
+    if (g_collectConflicts && acc.conflictItems.size() < kMaxConflictItems)
+        acc.conflictItems.push_back(ConflictItem{src, dst, size, dstSize, fc});
 }
 
 // Cap recursion so a pathologically deep tree can't overflow the stack. The
@@ -339,6 +345,12 @@ void MergeScan(ScanResult& into, ScanResult& from) {
     for (auto& s : from.conflictSample)
         if (into.conflictSample.size() < kConflictSampleMax)
             into.conflictSample.push_back(std::move(s));
+    // Capped like the per-worker lists: over the cap the merged list is
+    // short of `conflicts`, which is exactly what conflictItemsComplete()
+    // detects (the compare dialog is then not offered).
+    for (auto& c : from.conflictItems)
+        if (into.conflictItems.size() < kMaxConflictItems)
+            into.conflictItems.push_back(std::move(c));
     if (into.classes.empty()) into.classes = std::move(from.classes);
     else into.classes.merge(from.classes);
 }
@@ -559,6 +571,114 @@ bool LookupCarriedClass(const std::wstring& srcLower, FileClass& fc) {
     if (it == g_carriedClasses.end()) return false;
     fc = it->second;
     return true;
+}
+
+// ---- per-file conflict decisions ------------------------------------------
+
+void SetCollectConflicts(bool on) { g_collectConflicts = on; }
+
+void SetFileDecisions(std::unordered_map<std::wstring, FileDecision>&& m) {
+    g_fileDecisions = std::move(m);
+}
+
+bool AnyFileDecisions() { return !g_fileDecisions.empty(); }
+
+bool LookupFileDecision(const std::wstring& srcLower, FileDecision& d) {
+    auto it = g_fileDecisions.find(srcLower);
+    if (it == g_fileDecisions.end()) return false;
+    d = it->second;
+    return true;
+}
+
+void AdjustForDecisions(const std::vector<ConflictItem>& items, Conflict policy,
+                        unsigned long long& bytes, unsigned long long& files,
+                        SkipInfo& skipped, unsigned long long& need) {
+    if (g_fileDecisions.empty()) return;
+    skipped.byChoice = true;
+    for (const ConflictItem& it : items) {
+        FileDecision d;
+        if (!LookupFileDecision(LowerCopy(it.src), d)) continue;
+        const unsigned long long grow =
+            (it.size > it.dstSize) ? it.size - it.dstSize : 0;
+        const bool policyCopies = PolicyCopies(policy, it.fc);
+        const bool userCopies = d.action != FileAction::Skip;
+        // Undo what the policy totals assumed for this file...
+        if (policyCopies) {
+            bytes -= it.size; files -= 1; need -= grow;
+        } else {
+            skipped.policyFiles -= 1; skipped.policyBytes -= it.size;
+        }
+        // ...and apply the user's pick instead.
+        if (userCopies) {
+            bytes += it.size; files += 1;
+            need += (d.action == FileAction::Rename) ? it.size : grow;
+        } else {
+            skipped.policyFiles += 1; skipped.policyBytes += it.size;
+        }
+    }
+}
+
+bool IsImageFile(const std::wstring& path) {
+    size_t dot = path.find_last_of(L'.');
+    size_t slash = path.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
+        return false;
+    static const std::unordered_set<std::wstring> kExt = {
+        L"jpg", L"jpeg", L"jpe", L"jfif", L"png", L"gif", L"bmp", L"dib",
+        L"tif", L"tiff", L"webp", L"heic", L"heif", L"avif", L"jxl", L"ico",
+        L"psd", L"tga", L"exr", L"hdr",
+        // camera RAW
+        L"dng", L"cr2", L"cr3", L"crw", L"nef", L"nrw", L"arw", L"srf", L"sr2",
+        L"orf", L"rw2", L"raf", L"pef", L"srw", L"x3f", L"3fr", L"erf", L"kdc",
+        L"mrw", L"raw", L"rwl", L"iiq"};
+    return kExt.count(LowerCopy(path.substr(dot + 1))) > 0;
+}
+
+std::wstring NumberedName(const std::wstring& name, int n) {
+    std::wstring stem = name, ext;
+    size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot != 0) {
+        stem = name.substr(0, dot);
+        ext = name.substr(dot);
+    }
+    return stem + L" (" + std::to_wstring(n) + L")" + ext;
+}
+
+RenamePlanner::RenamePlanner(const std::vector<RoboJob>& jobs) {
+    // Loose-file jobs: exactly these names arrive in dstDir. (Whole-tree
+    // jobs are covered by checking the item's own source folder in Reserve —
+    // a tree maps one source folder onto one destination folder.)
+    for (const RoboJob& j : jobs) {
+        if (j.files.empty()) continue;
+        auto& set = incoming_[LowerCopy(StripTrailingSep(j.dstDir))];
+        for (size_t i = 0; i < j.files.size(); ++i)
+            set.insert(LowerCopy(i < j.dstNames.size() ? j.dstNames[i] : j.files[i]));
+    }
+}
+
+std::wstring RenamePlanner::Reserve(const ConflictItem& it) {
+    std::wstring name = Peek(it);
+    taken_.insert(LowerCopy(JoinPath(ParentDir(it.dst), name)));
+    return name;
+}
+
+std::wstring RenamePlanner::Peek(const ConflictItem& it) const {
+    const std::wstring dir = ParentDir(it.dst);
+    const std::wstring srcDir = ParentDir(it.src);
+    const std::wstring name = BaseName(it.dst);
+    const auto inc = incoming_.find(LowerCopy(dir));
+    for (int n = 2;; ++n) {
+        std::wstring cand = NumberedName(name, n);
+        std::wstring full = JoinPath(dir, cand);
+        std::wstring key = LowerCopy(full);
+        if (taken_.count(key)) continue;
+        if (Exists(full)) continue;
+        // Conservative: any same-named file in the source folder counts as
+        // incoming, selected or not — costs at most a higher number.
+        if (Exists(JoinPath(srcDir, cand))) continue;
+        if (inc != incoming_.end() && inc->second.count(LowerCopy(cand))) continue;
+        return cand;
+    }
 }
 
 bool IsExcludedDir(const std::wstring& name) {

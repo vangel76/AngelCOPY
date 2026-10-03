@@ -98,6 +98,36 @@ build.bat                                             REM -> dist\*.dll, *.exe
     via `CopySink` callbacks.
   - `ConflictUI.cpp` — pre-transfer conflict prompt (Replace / Only if newer /
     Skip / Cancel). `ConfirmUI.cpp` — the mandatory delete confirmation.
+  - `CompareUI.cpp` — **per-image compare dialog** (Oct 2026), reached via the
+    conflict prompt's "Compare images one by one…" button. Walks IMAGE
+    conflicts (`IsImageFile`, by extension) with shell thumbnails side by side
+    (`IShellItemImageFactory` on a worker STA, never the UI thread) + size /
+    dimensions / date. **Clicking an image keeps THAT one** (left = new =
+    overwrite, right = existing = skip; hover shows "Keep this one"; right-
+    click opens full size — asked for, Linux-style). Buttons say the same:
+    Keep new / Keep existing / Keep both (the "(n)" name is shown up front
+    via `RenamePlanner::Peek`). "Do the same for all
+    remaining" covers images AND non-images. Undecided non-image rest gets the
+    ordinary prompt. Load-bearing:
+    - Picks become `FileDecision`s (process-wide, `SetFileDecisions`, same
+      lifecycle as carried classes), consulted by the engine's `DecideSkip`
+      ONLY for files that classify as Diff* at copy time — on all three paths
+      (deferred pool, inline big-file, loose plan). Undecided → policy.
+    - **Never for a mirror**: a kept "a (2).jpg" isn't in the source, the
+      purge would delete it. Sync never prompts and never collects
+      `conflictItems` (`SetCollectConflicts(!sync)`).
+    - Keep-both names come from `RenamePlanner`: "(n)" free at the
+      destination, not an incoming source name (own source folder + loose jobs
+      into the same folder), not handed out twice. The engine writes them with
+      `noReplace` (COPY_FILE_FAIL_IF_EXISTS / CREATE_NEW / no
+      MOVEFILE_REPLACE_EXISTING) — a name taken since the prompt errors out,
+      it never overwrites.
+    - Totals: `AdjustForDecisions` corrects ExpectedFor/SkippedFor/
+      NeededSpaceFor (rename = full size, overwrite = growth); the space check
+      runs after it. Offered only with the COMPLETE conflict list
+      (`kMaxConflictItems` = 10000).
+    - Tests: `tests\test_native.cpp` (decisions on every path, move+rename,
+      noReplace refusal, planner collisions, totals, scan collection).
   - `Delete.cpp` — own recursive deleter (see gotchas). Also
     holds `ScanDelete` (files/dirs/bytes, feeds the delete prompt AND the
     properties dialog) on the `ScanWork`/`DrainScanWork` 8-worker queue.
@@ -522,7 +552,9 @@ build.bat                                             REM -> dist\*.dll, *.exe
   report box (caption + borders are ~39px).
 - **The dialog only auto-closes on a clean, complete run.** Anything skipped
   (`SkipInfo::any()`) or any error keeps it open with a Close button, so the user
-  sees what happened. When everything is skipped `total == 0` — that must render
+  sees what happened. Exception: skips the user picked in the compare dialog
+  (`SkipInfo::byChoice`) are their own answers, not news — those runs
+  auto-close (asked for, Oct 2026). When everything is skipped `total == 0` — that must render
   as 100%, not 0%. The **"Keep window open when done" checkbox** additionally
   turns the clean-run auto-close into Done+Close; its state is global
   (`HKCU\Software\AngelCOPY\KeepOpenAfterDone`) and saved on every toggle, not

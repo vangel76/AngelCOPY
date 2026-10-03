@@ -35,6 +35,7 @@ cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /Fo:build\ ^
    AngelCopyRunner\main.cpp AngelCopyRunner\Robocopy.cpp ^
    AngelCopyRunner\NativeCopy.cpp ^
    AngelCopyRunner\ProgressUI.cpp AngelCopyRunner\ConflictUI.cpp ^
+   AngelCopyRunner\CompareUI.cpp ^
    AngelCopyRunner\ConfirmUI.cpp AngelCopyRunner\Delete.cpp ^
    AngelCopyRunner\VolumeLock.cpp AngelCopyRunner\PropsUI.cpp ^
    shared\Localize.cpp shared\Theme.cpp ^

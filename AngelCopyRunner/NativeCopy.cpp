@@ -111,7 +111,31 @@ struct Item {
     // parallelizes its stats instead of serializing them on the walk.
     FILETIME mtime{};
     bool classify = false;
+    // "Keep both" target (compare dialog): the name was free when the user
+    // picked it — never overwrite whatever may have appeared there since.
+    bool noReplace = false;
 };
+
+// The per-file skip decision. A conflict the user decided in the compare
+// dialog follows that pick (and a Rename retargets `it`); everything else
+// follows the policy — the shared predicate, as before.
+bool DecideSkip(Item& it, FileClass fc, Conflict policy) {
+    if (AnyFileDecisions() &&
+        (fc == FileClass::DiffNewer || fc == FileClass::DiffOlder)) {
+        FileDecision d;
+        if (LookupFileDecision(acutil::LowerCopy(it.src), d)) {
+            switch (d.action) {
+            case FileAction::Skip:      return true;
+            case FileAction::Overwrite: return false;
+            case FileAction::Rename:
+                it.dst = ParentOf(it.dst) + L"\\" + d.newName;
+                it.noReplace = true;
+                return false;
+            }
+        }
+    }
+    return PolicySkips(policy, fc);
+}
 
 struct Plan {
     std::vector<Item> smallItems;   // < kBigFileBytes, in directory walk order
@@ -201,7 +225,7 @@ void WalkStream(const std::wstring& srcDir, const std::wstring& dstDir,
                                        ? FileClass::Lonely
                                        : ClassifyOrCarried(it.src, it.dst, size,
                                                            fd.ftLastWriteTime);
-                    if (PolicySkips(policy, fc)) {
+                    if (DecideSkip(it, fc, policy)) {
                         if (sink.onSkip) sink.onSkip(it.src, it.size);
                     } else {
                         bigs.push_back(std::move(it));
@@ -261,13 +285,17 @@ bool CopyOneFile(const Item& it, const CopySink& sink) {
     for (int attempt = 0;; ++attempt) {
         BOOL cancelFlag = FALSE;
         if (CopyFileExW(xs.c_str(), xd.c_str(), CopyProgress, &ctx, &cancelFlag,
-                        0)) {
+                        it.noReplace ? COPY_FILE_FAIL_IF_EXISTS : 0)) {
             if (ctx.reported < it.size && sink.onBytes)
                 sink.onBytes(it.size - ctx.reported); // tiny files see no callback delta
             return true;
         }
         DWORD err = GetLastError();
         if (err == ERROR_REQUEST_ABORTED) return false; // cancel: partial dst removed
+        if (err == ERROR_FILE_EXISTS) { // keep-both target taken: retrying can't help
+            ReportError(sink, it.dst, err);
+            return false;
+        }
         if (err == ERROR_ACCESS_DENIED && !clearedRo) {
             DWORD a = GetFileAttributesW(xd.c_str());
             if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
@@ -316,7 +344,7 @@ DWORD RingCopyFile(const Item& it, const CopySink& sink) {
     GetFileTime(hs, &tCreate, &tAccess, &tWrite);
 
     HANDLE hd = CreateFileW(ExtPath(it.dst).c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS,
+                            it.noReplace ? CREATE_NEW : CREATE_ALWAYS,
                             FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
     if (hd == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
@@ -490,7 +518,8 @@ bool CopyOneBig(const Item& it, const CopySink& sink) {
 bool MoveOneFile(const Item& it, const CopySink& sink) {
     const std::wstring xs = ExtPath(it.src), xd = ExtPath(it.dst);
     for (int pass = 0; pass < 2; ++pass) {
-        if (MoveFileExW(xs.c_str(), xd.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        if (MoveFileExW(xs.c_str(), xd.c_str(),
+                        it.noReplace ? 0 : MOVEFILE_REPLACE_EXISTING)) {
             if (sink.onBytes && it.size) sink.onBytes(it.size);
             return true;
         }
@@ -678,7 +707,7 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                 pool.emplace_back([&] {
                     std::vector<Item> chunk;
                     while (queue.Pop(chunk))
-                        for (const Item& it : chunk) {
+                        for (Item& it : chunk) {
                             if (Cancelled(sink)) return;
                             if (it.classify) {
                                 // Deferred dest stat (see WalkStream): decide
@@ -687,7 +716,7 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                                 // Carried scan verdicts skip the stat entirely.
                                 FileClass fc = ClassifyOrCarried(
                                     it.src, it.dst, it.size, it.mtime);
-                                if (PolicySkips(policy, fc)) {
+                                if (DecideSkip(it, fc, policy)) {
                                     if (sink.onSkip) sink.onSkip(it.src, it.size);
                                     continue;
                                 }
@@ -737,7 +766,7 @@ int RunNativeJobs(Operation op, const std::vector<RoboJob>& jobs,
                 FileClass fc =
                     ClassifyOrCarried(src, dst, size, fa.ftLastWriteTime);
                 Item it{std::move(src), std::move(dst), size};
-                if (PolicySkips(policy, fc))    plan.skips.push_back(std::move(it));
+                if (DecideSkip(it, fc, policy)) plan.skips.push_back(std::move(it));
                 else if (size >= kBigFileBytes) plan.big.push_back(std::move(it));
                 else                            plan.smallItems.push_back(std::move(it));
             }

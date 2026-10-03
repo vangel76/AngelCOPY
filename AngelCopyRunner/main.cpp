@@ -23,10 +23,12 @@
 #include "NativeCopy.h"
 #include "ProgressUI.h"
 #include "ConflictUI.h"
+#include "CompareUI.h"
 #include "ConfirmUI.h"
 #include "Delete.h"
 #include "PropsUI.h"
 #include "../shared/Localize.h"
+#include "../shared/Util.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -88,12 +90,11 @@ bool FreeSpaceAt(const std::wstring& dir, unsigned long long& freeBytes) {
     return true;
 }
 
-// Warn (GUI) if the destination looks too small for what `policy` will copy.
+// Warn (GUI) if the destination looks too small for `need` bytes (what the
+// chosen policy/decisions will write — NeededSpaceFor + AdjustForDecisions).
 // Advisory: returns false only if the user cancels at the warning. A failed or
 // unavailable free-space query, or a copy that fits, returns true silently.
-bool SpaceOkOrConfirmed(const std::wstring& dest, const ScanResult& scan,
-                        Conflict policy) {
-    unsigned long long need = NeededSpaceFor(scan, policy);
+bool SpaceOkOrConfirmed(const std::wstring& dest, unsigned long long need) {
     if (need == 0) return true;
     unsigned long long freeBytes = 0;
     if (!FreeSpaceAt(dest, freeBytes)) return true; // can't tell -> don't block
@@ -108,6 +109,39 @@ int Usage() {
              L"       AngelCopyRunner [--console] delete <src...|@listfile>\n"
              L"       AngelCopyRunner [--console] props <src...|@listfile>\n");
     return 2;
+}
+
+// Per-image compare flow, entered from the conflict prompt's "Compare images
+// one by one" button. Image conflicts are decided one at a time; whatever is
+// left undecided (non-image conflicts, when "do the same for all" was never
+// ticked) gets the ordinary all-at-once prompt for just that rest. On success
+// the decisions are installed for the engine and `policy` covers every
+// conflict without a decision. Returns false when the user cancelled.
+bool DecideEachImage(Operation op, const std::vector<RoboJob>& jobs,
+                     const ScanResult& scan, Conflict& policy) {
+    RenamePlanner renamer(jobs);
+    std::unordered_map<std::wstring, FileDecision> decisions;
+    CompareOutcome o = AskCompareImages(scan.conflictItems, renamer, decisions);
+    if (o.cancelled) return false;
+    // Everything decided: Replace only reaches files that started to
+    // conflict after the scan — the same default as "no conflicts found".
+    policy = o.restDecided ? o.restPolicy : Conflict::Replace;
+    if (!o.restDecided) {
+        unsigned long long restCount = 0;
+        std::vector<std::wstring> rest;
+        for (const ConflictItem& c : scan.conflictItems) {
+            if (decisions.count(acutil::LowerCopy(c.src))) continue;
+            ++restCount;
+            if (rest.size() < 500) rest.push_back(c.dst);
+        }
+        if (restCount) {
+            bool cancelled = false;
+            policy = AskConflict(op, restCount, rest, cancelled);
+            if (cancelled) return false;
+        }
+    }
+    SetFileDecisions(std::move(decisions));
+    return true;
 }
 
 // Collect sources from either an @listfile or the remaining argv entries.
@@ -233,6 +267,9 @@ int wmain(int argc, wchar_t** argv) {
     // consumes them (SetCarriedClasses below) rather than paying a SECOND
     // round of destination stats. Console runs scan nothing first.
     SetCollectClasses(!consoleMode);
+    // The compare dialog needs the full conflict list (GUI copy/move only —
+    // a mirror never prompts per file, see SetFileDecisions).
+    SetCollectConflicts(!consoleMode && !sync);
 
     // Unreal preset (GUI only): a .uproject in a whole-tree source → offer to
     // skip the regenerable cache folders. Decided BEFORE the scan so totals,
@@ -299,7 +336,8 @@ int wmain(int argc, wchar_t** argv) {
         if (!AskSyncConfirm(files, bytes, delScan)) return 0; // nothing touched
         // Space check after confirmation: the purge frees space but runs after
         // the copy, so it can't be counted against the copy's need.
-        if (!SpaceOkOrConfirmed(dest, scan, Conflict::Replace)) return 0;
+        if (!SpaceOkOrConfirmed(dest, NeededSpaceFor(scan, Conflict::Replace)))
+            return 0;
         // Hand the scan's verdicts to the engine: the copy phase then skips
         // its second round of destination stats (see SetCarriedClasses).
         SetCarriedClasses(std::move(scan.classes));
@@ -340,18 +378,29 @@ int wmain(int argc, wchar_t** argv) {
     // skipped by robocopy and are not conflicts.
     Conflict policy = Conflict::Replace;
     if (scan.conflicts > 0) {
-        bool cancelled = false;
-        policy = AskConflict(op, scan.conflicts, scan.conflictSample, cancelled);
+        // "Compare images one by one" needs the COMPLETE conflict list (a
+        // capped one would leave files nobody decided) and an image in it.
+        const bool offerEach =
+            scan.conflictItemsComplete() &&
+            std::any_of(scan.conflictItems.begin(), scan.conflictItems.end(),
+                        [](const ConflictItem& c) { return IsImageFile(c.dst); });
+        bool cancelled = false, each = false;
+        policy = AskConflict(op, scan.conflicts, scan.conflictSample, cancelled,
+                             offerEach, &each);
         if (cancelled) return 0; // user aborted before anything was touched
+        if (each && !DecideEachImage(op, jobs, scan, policy)) return 0;
     }
-
-    // Space check runs AFTER the conflict prompt: the chosen policy decides how
-    // much is actually written ("Skip existing" needs far less than "Replace").
-    if (!SpaceOkOrConfirmed(dest, scan, policy)) return 0;
 
     unsigned long long bytes = 0, files = 0;
     ExpectedFor(scan, policy, bytes, files);
     SkipInfo skipped = SkippedFor(scan, policy);
+    unsigned long long need = NeededSpaceFor(scan, policy);
+    AdjustForDecisions(scan.conflictItems, policy, bytes, files, skipped, need);
+
+    // Space check runs AFTER the conflict prompt: the chosen policy (and the
+    // per-file picks) decide how much is written ("Skip existing" needs far
+    // less than "Replace", a "Keep both" costs the file's full size).
+    if (!SpaceOkOrConfirmed(dest, need)) return 0;
 
     // Hand the scan's verdicts to the engine: the copy phase then skips its
     // second round of destination stats (see SetCarriedClasses).

@@ -123,6 +123,29 @@ const wchar_t* kEn[] = {
     L"Compressed",
     // tray guide
     L"Open guide",
+    // image compare dialog
+    L"Compare images one by one\x2026",
+    L"AngelCOPY \x2014 Compare images",
+    L"Image %llu of %llu already exists at the destination",
+    L"New (source)",
+    L"Existing (destination)",
+    L"Size: %s%s",
+    L"Dimensions: %u \x00D7 %u%s",
+    L"Dimensions: \x2014",
+    L"Modified: %s%s",
+    L"  (newer)",
+    L"  (larger)",
+    L"  (more pixels)",
+    L"No preview",
+    L"Click an image to keep that one. Right-click: open full size.",
+    L"Do the same for the 1 remaining conflict",
+    L"Do the same for all %llu remaining conflicts",
+    L"Keep new",
+    L"Keep existing",
+    L"Keep both",
+    L"as chosen in the conflict prompt",
+    L"Keep this one",
+    L"\x201CKeep both\x201D saves the new image as: %s",
 };
 
 const wchar_t* kDe[] = {
@@ -244,6 +267,29 @@ const wchar_t* kDe[] = {
     L"Komprimiert",
     // tray guide
     L"Anleitung öffnen",
+    // image compare dialog
+    L"Bilder einzeln vergleichen\x2026",
+    L"AngelCOPY \x2014 Bilder vergleichen",
+    L"Bild %llu von %llu ist am Ziel bereits vorhanden",
+    L"Neu (Quelle)",
+    L"Vorhanden (Ziel)",
+    L"Größe: %s%s",
+    L"Abmessungen: %u \x00D7 %u%s",
+    L"Abmessungen: \x2014",
+    L"Geändert: %s%s",
+    L"  (neuer)",
+    L"  (größer)",
+    L"  (mehr Pixel)",
+    L"Keine Vorschau",
+    L"Bild anklicken = dieses behalten. Rechtsklick = in voller Größe öffnen.",
+    L"Dasselbe für den 1 verbleibenden Konflikt tun",
+    L"Dasselbe für alle %llu verbleibenden Konflikte tun",
+    L"Neues behalten",
+    L"Vorhandenes behalten",
+    L"Beide behalten",
+    L"wie im Konfliktdialog gewählt",
+    L"Dieses behalten",
+    L"\x201E" L"Beide behalten\x201C speichert das neue Bild als: %s",
 };
 
 static_assert(ARRAYSIZE(kEn) == (size_t)S::COUNT, "English table out of sync with enum S");

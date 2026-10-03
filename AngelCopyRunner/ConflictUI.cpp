@@ -17,6 +17,7 @@ namespace {
 constexpr int ID_REPLACE = 1001;
 constexpr int ID_SKIP    = 1002;
 constexpr int ID_NEWER   = 1003;
+constexpr int ID_EACH    = 1004;
 constexpr int ID_CANCEL  = IDCANCEL;
 
 // CLIENT dimensions; the window size is derived with AdjustWindowRectEx below.
@@ -27,6 +28,7 @@ constexpr int CH = 334;
 struct DlgState {
     Conflict choice = Conflict::Replace;
     bool cancelled = true;   // closing the window == cancel
+    bool each = false;       // "Compare images one by one" picked
     HFONT font = nullptr, fontBold = nullptr;
 };
 
@@ -47,6 +49,7 @@ LRESULT CALLBACK ConflictProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_REPLACE: st->choice = Conflict::Replace;        st->cancelled = false; DestroyWindow(hwnd); return 0;
         case ID_SKIP:    st->choice = Conflict::Skip;           st->cancelled = false; DestroyWindow(hwnd); return 0;
         case ID_NEWER:   st->choice = Conflict::ReplaceIfNewer; st->cancelled = false; DestroyWindow(hwnd); return 0;
+        case ID_EACH:    st->each = true;                       st->cancelled = false; DestroyWindow(hwnd); return 0;
         case ID_CANCEL:  st->cancelled = true; DestroyWindow(hwnd); return 0;
         }
         break;
@@ -65,7 +68,9 @@ using theme::SetFont;
 } // namespace
 
 Conflict AskConflict(Operation op, unsigned long long conflictCount,
-                     const std::vector<std::wstring>& sample, bool& cancelled) {
+                     const std::vector<std::wstring>& sample, bool& cancelled,
+                     bool offerEach, bool* decideEach) {
+    if (decideEach) *decideEach = false;
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -124,6 +129,18 @@ Conflict AskConflict(Operation op, unsigned long long conflictCount,
     HWND bCancel = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnCancel),
         WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false), CW - 116, by + bh + 8, 100, bh,
         hwnd, (HMENU)(INT_PTR)ID_CANCEL, hInst, nullptr);
+    // Per-image compare: row 2, between Skip and Cancel (wide — the German
+    // label is long). Only when the caller has the complete conflict list
+    // and at least one of the conflicts is an image.
+    HWND bEach = nullptr;
+    if (offerEach) {
+        bEach = CreateWindowW(L"BUTTON", loc::T(loc::S::BtnDecideEach),
+            WS_CHILD | WS_VISIBLE | theme::ButtonStyle(false), 16 + bw + 8,
+            by + bh + 8, CW - 116 - 8 - (16 + bw + 8), bh, hwnd,
+            (HMENU)(INT_PTR)ID_EACH, hInst, nullptr);
+        SetFont(bEach, st.font);
+        theme::ApplyToControl(bEach);
+    }
 
     SetFont(lblHead, st.fontBold);
     SetFont(lblSub, st.font);
@@ -144,6 +161,7 @@ Conflict AskConflict(Operation op, unsigned long long conflictCount,
     theme::RunModalLoop(hwnd);
 
     cancelled = st.cancelled;
+    if (decideEach) *decideEach = st.each;
     return st.choice;
 }
 
