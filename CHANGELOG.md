@@ -25,6 +25,15 @@ project aims to follow [Semantic Versioning](https://semver.org/).
 - **Skips chosen in the compare dialog no longer keep the progress window
   open** — they are the user's own answers. Other skips still do.
 
+## [1.5.3] — 2026-09-30
+
+### Fixed
+- **Transient "path not found" on destination folders no longer drops their
+  subtree.** A mirror to an SMB share reported ~30 existing destination
+  folders as `(0x00000003)` and left them out of the transfer. Destination
+  folder creation now retries like a file (/R:2 /W:2) and treats a folder
+  that exists after all as existing instead of reporting it.
+
 ## [1.5.2] — 2026-09-23
 
 ### Removed
